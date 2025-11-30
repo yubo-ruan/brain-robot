@@ -204,27 +204,26 @@ class MockRobotEnv(gym.Env):
                     image[y, x] = color
 
     def _compute_reward(self) -> float:
-        """Compute reward."""
-        reward = -0.01  # Time penalty
+        """Compute reward - sparse with shaping."""
+        reward = 0.0
 
-        # Distance to object (if not grasped)
-        if not self.object_grasped:
-            dist_to_object = np.linalg.norm(self.robot_pos - self.object_pos)
-            reward += -0.1 * dist_to_object  # Negative distance reward
-
-        # Reward for grasping
-        if self.object_grasped:
-            reward += 1.0
-
-        # Distance to target (if grasped)
-        if self.object_grasped:
-            dist_to_target = np.linalg.norm(self.object_pos[:2] - self.target_pos[:2])
-            reward += -0.1 * dist_to_target
-
-        # Success bonus
+        dist_to_object = np.linalg.norm(self.robot_pos - self.object_pos)
         dist_to_target = np.linalg.norm(self.object_pos[:2] - self.target_pos[:2])
-        if dist_to_target < 0.1 and not self.object_grasped:
-            reward += 100.0
+
+        if not self.object_grasped:
+            # Phase 1: Approach object
+            # Dense reward for getting close to object
+            reward = -dist_to_object
+        else:
+            # Phase 2: Transport to target
+            # Dense reward for getting object close to target
+            # Add small bonus for having grasped (but not per-step!)
+            reward = -dist_to_target + 0.5  # Bonus offset for grasping
+
+        # Success bonus (large, sparse)
+        object_moved = np.linalg.norm(self.object_pos[:2] - self._initial_object_pos[:2]) > 0.05
+        if dist_to_target < 0.1 and not self.object_grasped and object_moved:
+            reward += 10.0
 
         return reward
 
