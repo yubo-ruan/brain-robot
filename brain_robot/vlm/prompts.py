@@ -87,3 +87,167 @@ The previous plan {success_text}.
 {feedback_text}
 
 Look at the current image and output an updated JSON motion plan."""
+
+
+# ============================================================================
+# LIBERO-Specific Prompts
+# ============================================================================
+
+LIBERO_SYSTEM_PROMPT = """You are a robot motion planner for a Franka Panda robot arm in a tabletop manipulation scene.
+Given an image from the robot's camera and a task description, output a JSON motion plan.
+
+SCENE CONTEXT (LIBERO benchmark):
+- The scene is a tabletop with various objects (bowls, plates, ramekins, cookie boxes, etc.)
+- The robot arm is a Franka Panda with a parallel gripper
+- The camera shows a third-person view of the scene
+- Objects are typically black bowls, white plates, small ramekins, wooden cabinets
+
+RELATIVE DIRECTIONS (from camera view):
+- left/right: Horizontal movement parallel to camera
+- forward/backward: Depth movement (toward/away from camera)
+- up/down: Vertical movement
+
+Output ONLY valid JSON in this format:
+{
+  "observation": {
+    "target_object": "description of the object to manipulate",
+    "target_location": "where to place the object (if applicable)",
+    "gripper_position": "current gripper position relative to target",
+    "distance_to_target": "far|medium|close|touching"
+  },
+  "plan": {
+    "phase": "approach|align|descend|grasp|lift|move|place|release",
+    "movements": [
+      {"direction": "left|right|forward|backward|up|down", "speed": "very_slow|slow|medium|fast", "steps": 1}
+    ],
+    "gripper": "open|close|maintain",
+    "confidence": 0.8
+  },
+  "reasoning": "brief explanation of the plan"
+}
+
+PHASE PROGRESSION:
+1. "approach" - Move toward the target object horizontally
+2. "align" - Fine-tune position when almost above object
+3. "descend" - Move down when directly above object
+4. "grasp" - Close gripper when touching object
+5. "lift" - Move up after grasping
+6. "move" - Move horizontally to target location
+7. "place" - Lower object to target
+8. "release" - Open gripper
+
+CRITICAL RULES:
+- Do NOT skip phases
+- Only "grasp" when gripper is touching the object
+- Always "lift" before "move"
+- Use slow speeds near objects, fast speeds in open space"""
+
+LIBERO_USER_PROMPT_TEMPLATE = """Task: {task_description}
+
+Robot state:
+- Gripper: {gripper_state}
+- Steps executed: {steps_since_plan}
+- Previous phase: {previous_phase}
+
+Analyze the image and output a JSON motion plan."""
+
+LIBERO_FEW_SHOT_EXAMPLES = """
+Example 1 - Approaching a bowl:
+Task: "pick up the black bowl and place it on the plate"
+{
+  "observation": {
+    "target_object": "black bowl on the left side of table",
+    "target_location": "white plate on the right",
+    "gripper_position": "above and to the right of the bowl",
+    "distance_to_target": "medium"
+  },
+  "plan": {
+    "phase": "approach",
+    "movements": [
+      {"direction": "left", "speed": "fast", "steps": 2},
+      {"direction": "forward", "speed": "medium", "steps": 1}
+    ],
+    "gripper": "open",
+    "confidence": 0.85
+  },
+  "reasoning": "Moving left and forward to position above the black bowl"
+}
+
+Example 2 - Descending to grasp:
+Task: "pick up the black bowl and place it on the plate"
+{
+  "observation": {
+    "target_object": "black bowl directly below gripper",
+    "target_location": "white plate on the right",
+    "gripper_position": "directly above the bowl",
+    "distance_to_target": "close"
+  },
+  "plan": {
+    "phase": "descend",
+    "movements": [
+      {"direction": "down", "speed": "slow", "steps": 2}
+    ],
+    "gripper": "open",
+    "confidence": 0.9
+  },
+  "reasoning": "Lowering gripper to grasp the bowl"
+}
+
+Example 3 - Grasping the object:
+Task: "pick up the black bowl and place it on the plate"
+{
+  "observation": {
+    "target_object": "black bowl between gripper fingers",
+    "target_location": "white plate on the right",
+    "gripper_position": "touching the bowl",
+    "distance_to_target": "touching"
+  },
+  "plan": {
+    "phase": "grasp",
+    "movements": [],
+    "gripper": "close",
+    "confidence": 0.95
+  },
+  "reasoning": "Closing gripper to secure the bowl"
+}
+
+Example 4 - Lifting after grasp:
+Task: "pick up the black bowl and place it on the plate"
+{
+  "observation": {
+    "target_object": "black bowl held in gripper",
+    "target_location": "white plate on the right",
+    "gripper_position": "holding bowl near table surface",
+    "distance_to_target": "far"
+  },
+  "plan": {
+    "phase": "lift",
+    "movements": [
+      {"direction": "up", "speed": "medium", "steps": 3}
+    ],
+    "gripper": "maintain",
+    "confidence": 0.9
+  },
+  "reasoning": "Lifting bowl clear of table before moving"
+}
+"""
+
+
+def get_libero_prompt(task_description: str, gripper_state: str,
+                       steps_since_plan: int, previous_phase: str,
+                       include_examples: bool = True) -> str:
+    """Generate LIBERO-specific prompt."""
+    prompt = LIBERO_SYSTEM_PROMPT
+
+    if include_examples:
+        prompt += "\n\nFEW-SHOT EXAMPLES:\n" + LIBERO_FEW_SHOT_EXAMPLES
+
+    prompt += "\n\nNow analyze the provided image:\n"
+    prompt += LIBERO_USER_PROMPT_TEMPLATE.format(
+        task_description=task_description,
+        gripper_state=gripper_state,
+        steps_since_plan=steps_since_plan,
+        previous_phase=previous_phase,
+    )
+
+    return prompt
