@@ -1,17 +1,30 @@
 """
 LIBERO Environment Wrapper.
 Provides gym-style interface for RL training.
+
+Supports both state-based and image-based observations for
+testing different policy architectures.
 """
+
+import os
+# Set rendering backend before importing mujoco
+os.environ.setdefault('MUJOCO_GL', 'egl')
+os.environ.setdefault('PYOPENGL_PLATFORM', 'egl')
 
 import gymnasium as gym
 import numpy as np
-from typing import Dict, Tuple, Any, Optional
+from typing import Dict, Tuple, Any, Optional, List
 from PIL import Image
 
 
 class LIBEROEnvWrapper(gym.Env):
     """
     Wrapper for LIBERO environment with standard gym interface.
+
+    Supports:
+    - State-based observations for MLP policies
+    - Image-based observations for vision policies
+    - Both modalities for multi-modal policies
     """
 
     def __init__(
@@ -20,7 +33,8 @@ class LIBEROEnvWrapper(gym.Env):
         task_id: int = 0,
         max_episode_steps: int = 300,
         action_scale: float = 1.0,
-        image_size: Tuple[int, int] = (256, 256),
+        image_size: Tuple[int, int] = (128, 128),
+        obs_mode: str = "state",  # "state", "image", or "both"
     ):
         super().__init__()
 
@@ -29,18 +43,44 @@ class LIBEROEnvWrapper(gym.Env):
         self.max_episode_steps = max_episode_steps
         self.action_scale = action_scale
         self.image_size = image_size
+        self.obs_mode = obs_mode
+        self._env = None
 
         # Import LIBERO
-        from libero.libero import benchmark
+        from libero.libero.benchmark import get_benchmark
+        from libero.libero.envs import OffScreenRenderEnv
 
-        # Get task
-        benchmark_dict = benchmark.get_benchmark_dict()
-        self.benchmark = benchmark_dict[task_suite]()
+        # Get benchmark and task
+        self.benchmark = get_benchmark(task_suite)()
         self.task = self.benchmark.get_task(task_id)
         self.task_description = self.task.language
 
+        # Get BDDL file path
+        bddl_file = self.benchmark.get_task_bddl_file_path(task_id)
+
         # Create environment
-        self.env = self.benchmark.get_task_env(task_id)
+        env_args = {
+            'bddl_file_name': bddl_file,
+            'camera_heights': image_size[0],
+            'camera_widths': image_size[1],
+        }
+        self._env = OffScreenRenderEnv(**env_args)
+
+        # Get initial states for deterministic resets
+        try:
+            import torch
+            # Handle torch.load with weights_only=False for older checkpoints
+            init_states_path = os.path.join(
+                self._get_init_states_folder(),
+                self.task.problem_folder,
+                self.task.init_states_file,
+            )
+            self._init_states = torch.load(init_states_path, weights_only=False)
+        except Exception as e:
+            print(f"[Warning] Could not load init states: {e}")
+            print("[Warning] Will use random initialization")
+            self._init_states = None
+        self._init_state_idx = 0
 
         # Define spaces
         self.action_space = gym.spaces.Box(
@@ -59,6 +99,17 @@ class LIBEROEnvWrapper(gym.Env):
 
         self.step_count = 0
 
+    def _get_init_states_folder(self):
+        """Get path to init states folder."""
+        from libero.libero import get_libero_path
+        try:
+            return get_libero_path("init_states")
+        except:
+            # Fallback to default path
+            import libero.libero
+            libero_path = os.path.dirname(libero.libero.__file__)
+            return os.path.join(libero_path, "init_files")
+
     def reset(
         self,
         seed: Optional[int] = None,
@@ -68,7 +119,18 @@ class LIBEROEnvWrapper(gym.Env):
         if seed is not None:
             np.random.seed(seed)
 
-        obs = self.env.reset()
+        # Reset with initial state if available
+        self._env.reset()
+        if self._init_states is not None and len(self._init_states) > 0:
+            init_state = self._init_states[self._init_state_idx % len(self._init_states)]
+            self._init_state_idx += 1
+            obs = self._env.set_init_state(init_state)
+            # Run a few dummy steps for physics to settle
+            dummy_action = np.zeros(7)
+            for _ in range(5):
+                obs, _, _, _ = self._env.step(dummy_action)
+        else:
+            obs = self._env.reset()
         self.step_count = 0
 
         processed_obs = self._process_observation(obs)
@@ -89,7 +151,7 @@ class LIBEROEnvWrapper(gym.Env):
         scaled_action = action * self.action_scale
 
         # Step environment
-        obs, reward, done, info = self.env.step(scaled_action)
+        obs, reward, done, info = self._env.step(scaled_action)
 
         self.step_count += 1
 
@@ -171,15 +233,35 @@ class LIBEROEnvWrapper(gym.Env):
 
     def render(self) -> np.ndarray:
         """Render current frame."""
-        return self.env.render()
+        obs = self._env._get_observations()
+        if 'agentview_image' in obs:
+            return obs['agentview_image']
+        return np.zeros((*self.image_size, 3), dtype=np.uint8)
+
+    def get_state(self) -> Dict[str, np.ndarray]:
+        """Get full state for state-based policies."""
+        obs = self._env._get_observations()
+        return {
+            'eef_pos': obs.get('robot0_eef_pos', np.zeros(3)),
+            'eef_quat': obs.get('robot0_eef_quat', np.zeros(4)),
+            'gripper_qpos': obs.get('robot0_gripper_qpos', np.zeros(2)),
+            'joint_pos': obs.get('robot0_joint_pos', np.zeros(7)),
+            'object_state': obs.get('object-state', np.zeros(10)),
+        }
 
     def close(self):
         """Close environment."""
-        self.env.close()
+        if self._env is not None:
+            self._env.close()
 
     @property
     def unwrapped(self):
-        return self.env
+        return self._env
+
+    @property
+    def env(self):
+        """Backward compatibility."""
+        return self._env
 
 
 def make_libero_env(
