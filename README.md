@@ -154,12 +154,132 @@ brain_robot/
 - **Action Chunking**: Generates 10-step action sequences for temporal consistency
 - **Error Correction**: Cerebellar-inspired forward model for adaptive control
 
-## Results
+## LIBERO Benchmark Integration
 
-After pre-training the primitive selector:
-- 100% accuracy on direction-to-primitive mapping
-- Robot successfully moves toward target objects
-- VLM correctly identifies task phases and generates appropriate plans
+This project integrates with the [LIBERO](https://github.com/Lifelong-Robot-Learning/LIBERO) benchmark for realistic robot manipulation evaluation.
+
+### Supported Task Suites
+- `libero_spatial` - 10 tasks with varying spatial configurations
+- `libero_object` - 10 tasks with different objects
+- `libero_goal` - 10 tasks with different goals
+- `libero_90` - 90 diverse manipulation tasks
+- `libero_10` - 10 long-horizon tasks
+
+### Running LIBERO Experiments
+
+```bash
+# Compare Simple MLP vs Brain-Inspired approaches
+MUJOCO_GL=egl python scripts/compare_approaches_libero.py --n_demos 50 --n_eval 5
+
+# This generates:
+# - recordings/libero_comparison/simple_mlp.gif
+# - recordings/libero_comparison/brain_inspired.gif
+# - recordings/libero_comparison/comparison.gif (side-by-side)
+```
+
+### GIF Recordings with VLM Visualization
+
+The comparison script generates GIF recordings that include:
+- **Environment view**: Robot camera feed
+- **VLM phase annotation**: Current task phase (approach, grasp, lift, transport, place, release)
+- **Confidence score**: VLM planning confidence
+- **Primitive weights**: For brain-inspired policy, shows which primitives are active
+- **Phase progress bar**: Color-coded progress indicator
+
+---
+
+## Experiment Results Summary
+
+### Phase A-E Ablation Study Findings
+
+| Experiment | Key Finding |
+|------------|-------------|
+| **Phase A: PPO Fix** | Proper PPO achieves 99% on simple reaching, but struggles with multi-phase tasks |
+| **Phase B: No VLM** | Behavioral Cloning achieves **100%** success, outperforming PPO |
+| **Phase C: Distillation** | Distilled MLP achieves **99% @ 4612 FPS** (4600x speedup over VLM) |
+| **Phase D: Phase Conditioning** | Marginal benefit - baseline already 99% |
+| **Phase E: Forward Model** | **Hurts performance!** Best to remove entirely |
+
+### Optimal Architecture
+
+Based on extensive ablation:
+
+```
+State (9-15 dims) → MLP (128 hidden) → Action (7 dims)
+```
+
+**Key insights:**
+1. Simple MLP outperforms brain-inspired architecture
+2. Behavioral Cloning > PPO for multi-phase manipulation
+3. Remove VLM from inner loop (use distillation)
+4. Remove forward model (degrades performance)
+5. Remove motion primitives (unnecessary complexity)
+
+### LIBERO Results
+
+| Approach | Success Rate | FPS |
+|----------|-------------|-----|
+| Simple MLP (BC) | Testing | ~40 |
+| Brain-Inspired (BC) | Testing | ~40 |
+
+*Note: LIBERO tasks are significantly more challenging than mock environment tasks.*
+
+---
+
+## Visualization Tools
+
+### Record Task Execution
+```bash
+# Basic recording
+python scripts/record_task.py
+
+# Detailed recording with trajectory plot
+python scripts/record_detailed.py
+```
+
+### Output Files
+- `recordings/libero_comparison/` - LIBERO comparison GIFs
+- `recordings/detailed_episode.gif` - Detailed mock env recording
+- `recordings/trajectory_plot.png` - 3D trajectory visualization
+
+---
+
+## Project Structure
+
+```
+brain_robot/
+├── brain_robot/
+│   ├── action_generator/
+│   │   ├── brain_model.py      # Main action generator
+│   │   ├── plan_encoder.py     # JSON to embedding encoder
+│   │   └── forward_model.py    # Cerebellum forward model
+│   ├── vlm/
+│   │   ├── qwen_planner.py     # VLM planner interface
+│   │   └── prompts.py          # System prompts for VLM
+│   ├── env/
+│   │   ├── mock_env.py         # Mock robot environment
+│   │   └── libero_wrapper.py   # LIBERO benchmark wrapper
+│   └── training/
+│       └── rewards.py          # Reward shaping
+├── scripts/
+│   ├── train_extended.py       # Main training script
+│   ├── compare_approaches_libero.py  # LIBERO comparison
+│   ├── record_task.py          # Task recording
+│   ├── record_detailed.py      # Detailed recording
+│   └── ...                     # Other training scripts
+├── recordings/                 # Generated GIFs and plots
+├── checkpoints/                # Saved model checkpoints
+└── EXPERIMENTS_SUMMARY.md      # Detailed experiment results
+```
+
+## Key Features
+
+- **Brain-Inspired Architecture**: Mimics the hierarchical motor control system
+- **VLM Integration**: Uses state-of-the-art vision-language model for planning
+- **LIBERO Benchmark**: Integration with realistic manipulation tasks
+- **Visualization Tools**: GIF recordings with VLM output overlay
+- **Ablation Study**: Comprehensive experiments comparing approaches
+- **Interpretable Primitives**: Clear separation of motion primitives for debugging
 
 ## License
 
