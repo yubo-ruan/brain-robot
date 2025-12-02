@@ -10,28 +10,87 @@ Replace oracle perception with learned perception that:
 
 ---
 
+## Critical Design Decisions
+
+### 1. Class vs Instance ID Separation
+
+The detector outputs **object classes** (bowl, plate, cabinet), not instance IDs.
+A separate **tracking layer** maintains stable instance IDs across frames.
+
+```
+Detection: class="bowl", bbox=[100,200,150,250], confidence=0.95
+     ↓
+Tracking: matches to existing track → instance_id="akita_black_bowl_1_main"
+     ↓
+PerceptionResult.objects["akita_black_bowl_1_main"] = pose
+```
+
+**Rationale**: Training YOLO to distinguish `bowl_1` vs `bowl_2` is brittle and unnecessary - they're visually identical. The tracker handles identity.
+
+### 2. Object Tracking (Required Component)
+
+Simple nearest-neighbor tracking in 3D:
+- For each detection, match to existing track with same class and closest position
+- If no match within threshold, spawn new track with new instance ID
+- Tracks persist across frames, providing stable IDs to WorldState
+
+```python
+@dataclass
+class ObjectTrack:
+    instance_id: str           # e.g., "akita_black_bowl_1_main"
+    class_name: str            # e.g., "bowl"
+    last_pose: np.ndarray      # Last known 3D position
+    last_seen: float           # Timestamp
+    confidence: float          # Detection confidence
+```
+
+### 3. Episode-Level Data Splits
+
+**Critical**: Split train/val by `(task_id, episode_idx)`, NOT by individual frames.
+
+Frames within an episode are highly correlated. Frame-level splits cause data leakage and inflated metrics.
+
+```python
+# WRONG: Frame-level split (data leakage)
+random.shuffle(all_frames)
+train = all_frames[:split]
+
+# CORRECT: Episode-level split
+episodes = group_by(all_frames, key=lambda f: (f.task_id, f.episode_idx))
+random.shuffle(episodes)
+train_episodes = episodes[:split]
+```
+
+---
+
 ## Architecture Overview
 
 ```
 RGB Image(s)
      ↓
-┌────────────────────────────────────────┐
-│     Learned Perception Pipeline        │
-│                                        │
-│  ┌─────────────┐    ┌──────────────┐  │
-│  │ Object      │    │ Pose         │  │
-│  │ Detection   │───▶│ Estimation   │  │
-│  │ (YOLO/SAM)  │    │ (KeyPoints)  │  │
-│  └─────────────┘    └──────────────┘  │
-│         │                  │          │
-│         ▼                  ▼          │
-│  ┌─────────────┐    ┌──────────────┐  │
-│  │ Spatial     │    │ Gripper      │  │
-│  │ Relations   │◀───│ State        │  │
-│  │ (from poses)│    │ (proprio)    │  │
-│  └─────────────┘    └──────────────┘  │
-│                                        │
-└────────────────────────────────────────┘
+┌────────────────────────────────────────────┐
+│       Learned Perception Pipeline          │
+│                                            │
+│  ┌─────────────┐    ┌──────────────┐      │
+│  │ Object      │    │ Pose         │      │
+│  │ Detection   │───▶│ Estimation   │      │
+│  │ (YOLO)      │    │ (Centroid)   │      │
+│  └─────────────┘    └──────────────┘      │
+│         │                  │              │
+│         ▼                  ▼              │
+│  ┌─────────────┐    ┌──────────────┐      │
+│  │ Object      │    │ Spatial      │      │
+│  │ Tracker     │───▶│ Relations    │      │
+│  │ (NN in 3D)  │    │ (Geometric)  │      │
+│  └─────────────┘    └──────────────┘      │
+│                            │              │
+│                     ┌──────────────┐      │
+│                     │ Gripper      │      │
+│                     │ State        │      │
+│                     │ (Proprio)    │      │
+│                     └──────────────┘      │
+│                                            │
+└────────────────────────────────────────────┘
      ↓
 PerceptionResult (same API as oracle)
 ```
@@ -124,17 +183,32 @@ class PerceptionDataCollector:
         pass
 
     def save_dataset(self, split_ratio: float = 0.9):
-        """Save collected data as train/val split."""
-        random.shuffle(self.data_points)
-        split = int(len(self.data_points) * split_ratio)
+        """Save collected data as train/val split (episode-level)."""
+        # Group frames by episode (CRITICAL: avoid data leakage)
+        episodes = defaultdict(list)
+        for dp in self.data_points:
+            key = (dp.task_id, dp.episode_idx)
+            episodes[key].append(dp)
+
+        # Shuffle and split at episode level
+        episode_keys = list(episodes.keys())
+        random.shuffle(episode_keys)
+        split = int(len(episode_keys) * split_ratio)
+
+        train_keys = episode_keys[:split]
+        val_keys = episode_keys[split:]
 
         train_dir = self.output_dir / "train"
         val_dir = self.output_dir / "val"
 
-        for dp in self.data_points[:split]:
-            self._save_data_point(dp, train_dir)
-        for dp in self.data_points[split:]:
-            self._save_data_point(dp, val_dir)
+        for key in train_keys:
+            for dp in episodes[key]:
+                self._save_data_point(dp, train_dir)
+        for key in val_keys:
+            for dp in episodes[key]:
+                self._save_data_point(dp, val_dir)
+
+        print(f"Saved {len(train_keys)} train episodes, {len(val_keys)} val episodes")
 ```
 
 #### 3. Keyframe Selection Strategy
