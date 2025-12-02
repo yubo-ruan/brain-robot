@@ -8,6 +8,8 @@ from .approach import ApproachSkill
 from .grasp import GraspSkill
 from .move import MoveSkill
 from .place import PlaceSkill
+from .drawer import OpenDrawerSkill, CloseDrawerSkill
+from .stove import TurnOnStoveSkill, TurnOffStoveSkill
 
 __all__ = [
     "Skill",
@@ -16,6 +18,10 @@ __all__ = [
     "GraspSkill",
     "MoveSkill",
     "PlaceSkill",
+    "OpenDrawerSkill",
+    "CloseDrawerSkill",
+    "TurnOnStoveSkill",
+    "TurnOffStoveSkill",
 ]
 
 
@@ -25,6 +31,10 @@ SKILL_REGISTRY = {
     "GraspObject": GraspSkill,
     "MoveObjectToRegion": MoveSkill,
     "PlaceObject": PlaceSkill,
+    "OpenDrawer": OpenDrawerSkill,
+    "CloseDrawer": CloseDrawerSkill,
+    "TurnOnStove": TurnOnStoveSkill,
+    "TurnOffStove": TurnOffStoveSkill,
 }
 
 
