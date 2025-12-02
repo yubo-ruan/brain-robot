@@ -311,46 +311,240 @@ class Logger:
             json.dump(asdict(self.current_episode), f, indent=2, default=str)
 ```
 
-#### 7. Determinism & Testing
+#### 7. Seed Management & Determinism (CRITICAL)
 
 ```python
-def set_deterministic(seed: int = 42):
-    """Fix all RNG seeds for reproducibility."""
+def set_global_seed(seed: int, env=None):
+    """Set ALL RNG seeds including simulator for true reproducibility."""
+    random.seed(seed)
     np.random.seed(seed)
     torch.manual_seed(seed)
-    random.seed(seed)
-    # LIBERO/robosuite seeds set via env.reset(seed=seed)
+    torch.cuda.manual_seed_all(seed)
 
-# Unit-like tests for skills
-def test_approach_skill():
-    """ApproachObject brings gripper within threshold 95% of time."""
-    env = make_libero_env(task_suite="libero_spatial", task_id=0)
-    skill = ApproachSkill()
+    # CRITICAL: Also seed the simulator
+    if env is not None:
+        if hasattr(env, 'seed'):
+            env.seed(seed)
+        # robosuite/LIBERO wrapped env
+        if hasattr(env, '_env') and hasattr(env._env, 'seed'):
+            env._env.seed(seed)
 
-    successes = 0
-    for _ in range(20):
-        env.reset()
-        perception = oracle_perception(env)
-        obj_name = list(perception['objects'].keys())[0]
+    return seed
 
-        world_state = WorldState()
-        result = skill.run(env, world_state, {"obj": obj_name})
-
-        if result.success:
-            # Verify gripper is actually close
-            final_gripper = oracle_perception(env)['gripper_pose'][:3]
-            obj_pos = perception['objects'][obj_name][:3]
-            dist = np.linalg.norm(final_gripper - obj_pos - [0, 0, 0.1])  # Pre-grasp offset
-            if dist < 0.03:  # 3cm threshold
-                successes += 1
-
-    assert successes >= 19, f"ApproachSkill only succeeded {successes}/20 times"
+# Per-episode seed strategy
+def get_episode_seed(run_seed: int, episode_idx: int) -> int:
+    """Deterministic per-episode seed."""
+    return run_seed + episode_idx
 ```
 
-#### 8. Project Structure
+#### 8. Code/Model Version Logging
+
+```python
+import subprocess
+
+def get_git_info() -> dict:
+    """Get current git state for reproducibility."""
+    try:
+        commit = subprocess.check_output(
+            ['git', 'rev-parse', 'HEAD'],
+            stderr=subprocess.DEVNULL
+        ).decode().strip()[:8]
+
+        dirty = subprocess.call(
+            ['git', 'diff', '--quiet'],
+            stderr=subprocess.DEVNULL
+        ) != 0
+
+        return {"git_commit": commit, "git_dirty": dirty}
+    except:
+        return {"git_commit": "unknown", "git_dirty": None}
+
+# Log with every run
+run_log["code_version"] = get_git_info()
+run_log["model_versions"] = {
+    "qwen": "qwen2.5-vl-7b",
+    "plan_version": "v1.0",
+}
+run_log["config"] = asdict(config)
+```
+
+#### 9. Performance Profiling
+
+```python
+from contextlib import contextmanager
+from collections import defaultdict
+import time
+
+class Timer:
+    """Simple performance profiler."""
+    def __init__(self):
+        self.times = defaultdict(float)
+        self.counts = defaultdict(int)
+
+    @contextmanager
+    def measure(self, name: str):
+        start = time.perf_counter()
+        yield
+        self.times[name] += time.perf_counter() - start
+        self.counts[name] += 1
+
+    def summary(self) -> dict:
+        return {
+            name: {
+                "total": self.times[name],
+                "count": self.counts[name],
+                "avg": self.times[name] / self.counts[name] if self.counts[name] > 0 else 0
+            }
+            for name in self.times
+        }
+
+# Usage in episode loop
+timer = Timer()
+with timer.measure("perception"):
+    perception = perception_interface.perceive(env)
+with timer.measure("skill_approach"):
+    result = approach_skill.run(env, world_state, args)
+
+episode_log["timing"] = timer.summary()
+```
+
+#### 10. Debug Visualization Helper
+
+```python
+def debug_plot_poses(
+    gripper_pose: np.ndarray,
+    object_poses: Dict[str, np.ndarray],
+    target_pose: Optional[np.ndarray] = None,
+    save_path: Optional[str] = None
+):
+    """Quick 3D scatter plot for debugging skill failures."""
+    import matplotlib.pyplot as plt
+    from mpl_toolkits.mplot3d import Axes3D
+
+    fig = plt.figure(figsize=(8, 8))
+    ax = fig.add_subplot(111, projection='3d')
+
+    # Gripper (blue)
+    ax.scatter(*gripper_pose[:3], c='blue', s=100, label='gripper')
+
+    # Objects (green)
+    for name, pose in object_poses.items():
+        ax.scatter(*pose[:3], c='green', s=50)
+        ax.text(*pose[:3], name, fontsize=8)
+
+    # Target (red X)
+    if target_pose is not None:
+        ax.scatter(*target_pose[:3], c='red', s=100, marker='x', label='target')
+
+    ax.set_xlabel('X')
+    ax.set_ylabel('Y')
+    ax.set_zlabel('Z')
+    ax.legend()
+
+    if save_path:
+        plt.savefig(save_path)
+        plt.close()
+    else:
+        plt.show()
+```
+
+#### 11. Centralized Configuration
+
+```python
+from dataclasses import dataclass, field, asdict
+
+@dataclass
+class SkillConfig:
+    # Approach
+    approach_max_steps: int = 100
+    approach_pos_threshold: float = 0.03  # 3cm
+    approach_pregrasp_height: float = 0.10  # 10cm above
+
+    # Grasp
+    grasp_max_steps: int = 50
+    grasp_lower_speed: float = 0.02
+    grasp_lift_height: float = 0.05
+
+    # Control gains
+    kp_pos: float = 5.0
+    kp_ori: float = 2.0
+
+@dataclass
+class PerceptionConfig:
+    use_oracle: bool = True
+    noise_pos_std: float = 0.0  # For noisy oracle testing
+    noise_ori_std: float = 0.0
+
+@dataclass
+class RunConfig:
+    seed: int = 42
+    task_suite: str = "libero_spatial"
+    task_id: int = 0
+    n_episodes: int = 20
+
+    skill: SkillConfig = field(default_factory=SkillConfig)
+    perception: PerceptionConfig = field(default_factory=PerceptionConfig)
+
+    # Success criteria
+    success_rate_threshold: float = 0.8
+
+# Usage
+config = RunConfig()
+episode_log["config"] = asdict(config)
+```
+
+#### 12. Per-Skill Unit Tests
+
+```python
+def test_approach_success_under_oracle():
+    """ApproachObject reaches target under perfect perception."""
+    env = make_libero_env(task_suite="libero_spatial", task_id=0)
+    set_global_seed(42, env)
+
+    env.reset()
+    perception = OraclePerception().perceive(env)
+    world_state = WorldState()
+    world_state.update_from_perception(perception)
+
+    obj_id = list(perception.objects.keys())[0]
+    skill = ApproachSkill(max_steps=100, pos_threshold=0.03)
+
+    result = skill.run(env, world_state, {"obj": obj_id})
+
+    assert result.success, f"Approach failed: {result.info}"
+    assert result.info["steps"] < 100, "Should not timeout"
+
+    # Verify actual position
+    final_perception = OraclePerception().perceive(env)
+    dist = np.linalg.norm(
+        final_perception.gripper_pose[:3] -
+        perception.objects[obj_id][:3] -
+        np.array([0, 0, 0.1])
+    )
+    assert dist < 0.03, f"Gripper not at target: {dist}m away"
+
+def test_approach_timeout_on_unreachable():
+    """ApproachObject times out gracefully for unreachable target."""
+    env = make_libero_env(task_suite="libero_spatial", task_id=0)
+    set_global_seed(42, env)
+
+    skill = ApproachSkill(max_steps=10)  # Very short timeout
+
+    # Create unreachable target
+    fake_target = {"obj": "nonexistent_object"}
+    world_state = WorldState()
+
+    result = skill.run(env, world_state, fake_target)
+
+    assert not result.success
+    assert "timeout" in result.info.get("error", "") or "not found" in result.info.get("error", "")
+```
+
+#### 13. Project Structure
 
 ```
 brain_robot/
+├── config.py                  # RunConfig, SkillConfig, PerceptionConfig
 ├── skills/
 │   ├── __init__.py
 │   ├── base.py                # Skill, SkillResult base classes
@@ -360,33 +554,43 @@ brain_robot/
 │   └── place.py               # PlaceObject
 ├── perception/
 │   ├── __init__.py
-│   └── oracle.py              # Ground truth from simulator
+│   ├── interface.py           # PerceptionInterface ABC
+│   ├── oracle.py              # OraclePerception (ground truth)
+│   └── noisy_oracle.py        # NoisyOraclePerception (for robustness testing)
 ├── world_model/
 │   ├── __init__.py
 │   ├── state.py               # WorldState, ObjectState classes
-│   └── relations.py           # Relation update logic
+│   └── goals.py               # TaskGoal for explicit goal representation
 ├── control/
 │   ├── __init__.py
 │   └── cartesian_pd.py        # Pose controller
+├── utils/
+│   ├── __init__.py
+│   ├── seeds.py               # set_global_seed, get_episode_seed
+│   ├── timing.py              # Timer class
+│   ├── git_info.py            # get_git_info
+│   └── visualization.py       # debug_plot_poses
 ├── logging/
 │   ├── __init__.py
 │   └── episode_logger.py      # EpisodeLog, Logger classes
 └── tests/
     ├── __init__.py
     ├── test_frames.py         # Coordinate frame tests
-    └── test_skills.py         # Skill unit tests
+    └── test_skills.py         # Per-skill unit tests
 ```
 
 ### Success Criteria
 
 - [ ] Coordinate frame test passes
 - [ ] Pick & place works without Qwen (hardcoded skill sequence)
-- [ ] All skills return structured SkillResult
+- [ ] All skills return structured SkillResult with timeouts
 - [ ] World state updates correctly after each skill
-- [ ] Logging saves episode traces to disk
+- [ ] Logging saves episode traces to disk (with config, timing, git info)
 - [ ] Skill unit tests pass (>95% success with oracle)
+- [ ] Seeds are deterministic (same seed = same behavior)
+- [ ] Performance profiling shows reasonable per-step timing
 - [ ] GIF recording showing execution
-- [ ] Works on at least 1 LIBERO task
+- [ ] Works on at least 1 LIBERO task with >80% success rate
 
 ### Estimated Time: 5-7 days (realistic)
 
