@@ -13,7 +13,8 @@ class SkillConfig:
 
     # Approach skill
     approach_max_steps: int = 200  # Increased for convergence
-    approach_pos_threshold: float = 0.03  # 3cm
+    approach_pos_threshold: float = 0.03  # 3cm total position error
+    approach_xy_threshold: float = 0.05  # 5cm XY error (tighter than grasp precondition)
     approach_pregrasp_height: float = 0.10  # 10cm above object
 
     # Grasp skill

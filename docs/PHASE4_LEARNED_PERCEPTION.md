@@ -642,7 +642,8 @@ def evaluate_learned_perception(
 | Detection precision | >85% | **99.8%** | ✅ **Exceeds** |
 | Spatial ON accuracy | >85% | **91.7%** | ✅ **Exceeds** |
 | Spatial INSIDE accuracy | >80% | N/A | ⚠️ Not tested |
-| Task success rate | ≥80% | **96%** | ✅ **Exceeds** |
+| Task success (oracle bootstrap) | ≥80% | **96%** | ✅ **Exceeds** |
+| Task success (cold bootstrap) | ≥80% | **88%** | ✅ **Exceeds** |
 | Inference latency | <50 ms | **~3 ms** | ✅ **Exceeds** |
 
 **Phase 4 Status: COMPLETE** 🎉
@@ -842,6 +843,92 @@ bash scripts/run_perception_comparison.sh
 ```
 
 **Results saved to**: `logs/phase4_comparison/`
+
+---
+
+### Phase 4.8: Cold Bootstrap & Skill Robustness ✅ COMPLETE
+
+**Goal**: Remove oracle dependency at episode start - run fully learned perception from frame 1.
+
+**The Problem**:
+With oracle bootstrap, we used privileged simulator information to initialize object instance IDs at episode start. Cold bootstrap removes this dependency, relying only on YOLO detections.
+
+**Initial Cold Bootstrap Results** (before fixes):
+| Task | Success Rate |
+|------|-------------|
+| 0 | 80% |
+| 1 | 90% |
+| 2 | 90% |
+| 3 | **10%** |
+| 4 | 70% |
+| **AVG** | **61%** |
+
+**Root Cause Analysis**:
+
+1. **Bowl detection confidence issue**: YOLO bowl detections had confidence 0.2-0.3, below the default 0.5 threshold
+2. **Depth sampling failure**: Small objects (bowls) had depth values dominated by background pixels
+3. **GraspSkill XY misalignment**: ApproachSkill succeeded but left gripper 10-19cm off in XY
+
+**Fixes Applied**:
+
+1. **Class-specific confidence thresholds** (`yolo_detector.py`):
+   ```python
+   class_confidence_thresholds = {
+       "bowl": 0.15,    # Lower for dark-colored bowls
+       "ramekin": 0.25, # Similar issue with small objects
+   }
+   ```
+
+2. **Robust depth sampling** (`learned.py`):
+   ```python
+   def _sample_depth_bbox(depth, bbox):
+       # Use minimum depth within bbox instead of center
+       # More robust for small objects where background dominates
+       return float(np.min(valid_depths))
+   ```
+
+3. **GraspSkill XY refinement** (`grasp.py`):
+   ```python
+   # Phase 0: XY Refinement before lowering
+   # Uses PD controller to servo gripper directly above object
+   # Corrects ApproachSkill residual positioning error
+   xy_refine_enabled = True
+   xy_refine_max_steps = 30
+   xy_refine_threshold = 0.03  # 3cm success
+   ```
+
+4. **ApproachSkill XY threshold** (`approach.py`):
+   ```python
+   # Dual threshold: total position AND XY-specific
+   approach_xy_threshold = 0.05  # 5cm XY error max
+   ```
+
+**Final Cold Bootstrap Results** (after fixes):
+| Task | Before | After | Delta |
+|------|--------|-------|-------|
+| 0 | 80% | **90%** | +10% |
+| 1 | 90% | **100%** | +10% |
+| 2 | 90% | **90%** | = |
+| 3 | 10% | **80%** | **+70%** |
+| 4 | 70% | **80%** | +10% |
+| **AVG** | 61% | **88%** | **+27%** |
+
+**All 5 tasks now meet the 80% threshold with fully learned perception.**
+
+**Key Insights**:
+- Task 3 (bowl on cookie box) was the hardest due to object geometry
+- Pose error was NOT the differentiator between success/failure
+- GraspSkill XY refinement was the single biggest improvement (+70% on Task 3)
+- Class-specific thresholds are pragmatic but dataset-specific (acceptable for LIBERO)
+
+**How to Run Cold Bootstrap**:
+```bash
+# Cold bootstrap (no oracle at episode start)
+python scripts/run_evaluation.py --mode hardcoded --perception learned --bootstrap cold --task-id 0
+
+# Oracle bootstrap (uses oracle for initial instance IDs)
+python scripts/run_evaluation.py --mode hardcoded --perception learned --bootstrap oracle --task-id 0
+```
 
 ---
 

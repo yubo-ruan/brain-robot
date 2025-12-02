@@ -29,29 +29,44 @@ class ApproachSkill(Skill):
         self,
         max_steps: int = 100,
         pos_threshold: float = 0.03,
+        xy_threshold: float = 0.05,
         pregrasp_height: float = 0.10,
         config: Optional[SkillConfig] = None,
     ):
         """Initialize ApproachSkill.
-        
+
         Args:
             max_steps: Maximum steps before timeout.
-            pos_threshold: Position error threshold for success (meters).
+            pos_threshold: Total position error threshold for success (meters).
+            xy_threshold: XY-specific error threshold (meters).
             pregrasp_height: Height above object for pre-grasp pose.
             config: Optional configuration (overrides other params).
         """
         super().__init__(max_steps=max_steps, config=config)
-        
+
         if config:
             self.pos_threshold = config.approach_pos_threshold
+            self.xy_threshold = config.approach_xy_threshold
             self.pregrasp_height = config.approach_pregrasp_height
             self.max_steps = config.approach_max_steps
         else:
             self.pos_threshold = pos_threshold
+            self.xy_threshold = xy_threshold
             self.pregrasp_height = pregrasp_height
-        
+
         self.controller = CartesianPDController.from_config(self.config)
-    
+
+    def _is_at_target(self, current_pose: np.ndarray, target_pose: np.ndarray) -> bool:
+        """Check if gripper is at target with both total and XY thresholds.
+
+        Uses a dual threshold: total position error AND XY-specific error.
+        This prevents declaring success when Z is correct but XY is far off.
+        """
+        total_error = np.linalg.norm(current_pose[:3] - target_pose[:3])
+        xy_error = np.linalg.norm(current_pose[:2] - target_pose[:2])
+
+        return total_error < self.pos_threshold and xy_error < self.xy_threshold
+
     def preconditions(self, world_state: WorldState, args: Dict[str, Any]) -> Tuple[bool, str]:
         """Check approach preconditions."""
         obj_name = args.get("obj")
@@ -127,9 +142,11 @@ class ApproachSkill(Skill):
 
             trajectory.append(current_pose[:3].copy())
 
-            # Check if at target - use relaxed orientation threshold for approach
-            # Position is what matters for pre-grasp; orientation can be off
-            if self.controller.is_at_target(current_pose, self.pos_threshold, ori_threshold=3.0):
+            # Check if at target with both total and XY thresholds
+            # This prevents declaring success when Z is correct but XY is far off
+            if self._is_at_target(current_pose, target_pose):
+                xy_error = np.linalg.norm(current_pose[:2] - target_pose[:2])
+                z_error = abs(current_pose[2] - target_pose[2])
                 return SkillResult(
                     success=True,
                     info={
@@ -137,6 +154,8 @@ class ApproachSkill(Skill):
                         "reached_target": True,
                         "final_pose": current_pose,
                         "final_error": self.controller.position_error(current_pose),
+                        "xy_error": xy_error,
+                        "z_error": z_error,
                     }
                 )
 
@@ -147,7 +166,9 @@ class ApproachSkill(Skill):
             last_obs = obs
 
         # Final check after all steps - might have reached target on last step
-        if current_pose is not None and self.controller.is_at_target(current_pose, self.pos_threshold, ori_threshold=3.0):
+        if current_pose is not None and self._is_at_target(current_pose, target_pose):
+            xy_error = np.linalg.norm(current_pose[:2] - target_pose[:2])
+            z_error = abs(current_pose[2] - target_pose[2])
             return SkillResult(
                 success=True,
                 info={
@@ -155,12 +176,16 @@ class ApproachSkill(Skill):
                     "reached_target": True,
                     "final_pose": current_pose,
                     "final_error": self.controller.position_error(current_pose),
+                    "xy_error": xy_error,
+                    "z_error": z_error,
                 }
             )
 
-        # Timeout
+        # Timeout - log XY/Z errors for diagnosis
         final_pose = current_pose
         final_error = self.controller.position_error(final_pose) if final_pose is not None else float('inf')
+        xy_error = np.linalg.norm(final_pose[:2] - target_pose[:2]) if final_pose is not None else float('inf')
+        z_error = abs(final_pose[2] - target_pose[2]) if final_pose is not None else float('inf')
 
         return SkillResult(
             success=False,
@@ -170,6 +195,8 @@ class ApproachSkill(Skill):
                 "timeout": True,
                 "final_pose": final_pose,
                 "final_error": final_error,
+                "xy_error": xy_error,
+                "z_error": z_error,
             }
         )
     
