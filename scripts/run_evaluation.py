@@ -119,7 +119,12 @@ def get_object_class(obj_id: str) -> str:
 
 
 def parse_task_for_grounding(task_description: str, object_names: list) -> tuple:
-    """Simple task parsing to find source and target objects (Phase 1 heuristic)."""
+    """Simple task parsing to find source and target objects (Phase 1 heuristic).
+
+    Supports multiple task formats:
+    - libero_spatial: "pick up the X and place it on the Y"
+    - libero_goal: "put the X on the Y"
+    """
     task_lower = task_description.lower()
 
     object_types = {}
@@ -136,11 +141,26 @@ def parse_task_for_grounding(task_description: str, object_names: list) -> tuple
         if 'drawer' in obj_lower:
             object_types.setdefault('drawer', []).append(obj_id)
         if 'cabinet' in obj_lower:
-            object_types.setdefault('cabinet', []).append(obj_id)
+            # For cabinets: prefer cabinet_top for "on top of" tasks, then main/base
+            if 'cabinet_top' in obj_lower:
+                object_types.setdefault('cabinet_top', []).append(obj_id)
+                object_types.setdefault('cabinet', []).append(obj_id)
+            elif '_main' in obj_lower or '_base' in obj_lower:
+                if 'cabinet_middle' not in obj_lower and 'cabinet_bottom' not in obj_lower:
+                    object_types.setdefault('cabinet', []).insert(0, obj_id)
+        if 'stove' in obj_lower:
+            # For stoves, prefer the main body but accept burner/plate as fallback
+            if 'burner' not in obj_lower and 'button' not in obj_lower:
+                object_types.setdefault('stove', []).insert(0, obj_id)  # Main stove first
+            elif 'burner_plate' in obj_lower or 'burner' in obj_lower:
+                object_types.setdefault('stove', []).append(obj_id)  # Burner as fallback
+        if 'bottle' in obj_lower:
+            object_types.setdefault('bottle', []).append(obj_id)
 
     source_obj = None
     target_obj = None
 
+    # Pattern 1: "pick up the X" / "grab the X" / etc.
     source_keywords = ['pick up the', 'pick the', 'grab the', 'take the']
     for kw in source_keywords:
         if kw in task_lower:
@@ -152,18 +172,60 @@ def parse_task_for_grounding(task_description: str, object_names: list) -> tuple
             if source_obj:
                 break
 
-    target_keywords = ['place it on the', 'place it in the', 'put it on the', 'put it in the',
-                       'place on the', 'place in the', 'on the', 'in the', 'into the']
-    for kw in target_keywords:
-        if kw in task_lower:
-            rest = task_lower.split(kw)[-1]
+    # Pattern 2: "put the X on/in the Y" (libero_goal style) - source comes before target
+    if not source_obj:
+        import re
+        # Handle "put the X on the Y", "put the X in the Y", "put the X on top of the Y"
+        # Note: source can be multi-word like "wine bottle"
+        put_match = re.search(r'put the (.+?) (on top of|on|in|into) the', task_lower)
+        if put_match:
+            source_phrase = put_match.group(1).strip()
+            # Try matching source_phrase to object types
             for obj_type, obj_list in object_types.items():
-                if obj_type in rest.split()[0:3]:
-                    target_obj = obj_list[0]
+                if obj_type in source_phrase or source_phrase.replace(' ', '_') in obj_type:
+                    source_obj = obj_list[0]
                     break
-            if target_obj:
-                break
+            # Also try without spaces (wine bottle -> wine_bottle -> bottle)
+            if not source_obj:
+                for obj_type, obj_list in object_types.items():
+                    source_words = source_phrase.split()
+                    if any(word == obj_type for word in source_words):
+                        source_obj = obj_list[0]
+                        break
+            # Also extract target from the same pattern
+            target_part = task_lower.split(put_match.group(0))[-1].strip()
+            preposition = put_match.group(2)  # "on top of", "on", "in", etc.
 
+            # For "on top of", prefer cabinet_top over cabinet
+            if preposition == 'on top of':
+                for obj_type, obj_list in object_types.items():
+                    target_base = target_part.split()[0]
+                    if obj_type == f'{target_base}_top':
+                        target_obj = obj_list[0]
+                        break
+
+            # Fallback to regular matching
+            if not target_obj:
+                for obj_type, obj_list in object_types.items():
+                    if obj_type in target_part.split()[0:3]:
+                        target_obj = obj_list[0]
+                        break
+
+    # Pattern 3: "place it on the Y" / "on the Y"
+    if not target_obj:
+        target_keywords = ['place it on the', 'place it in the', 'put it on the', 'put it in the',
+                           'place on the', 'place in the', 'on the', 'in the', 'into the']
+        for kw in target_keywords:
+            if kw in task_lower:
+                rest = task_lower.split(kw)[-1]
+                for obj_type, obj_list in object_types.items():
+                    if obj_type in rest.split()[0:3]:
+                        target_obj = obj_list[0]
+                        break
+                if target_obj:
+                    break
+
+    # Fallback: if source found but no target, pick different object type
     if source_obj and not target_obj:
         source_type = None
         for obj_type, obj_list in object_types.items():
@@ -175,10 +237,15 @@ def parse_task_for_grounding(task_description: str, object_names: list) -> tuple
                 target_obj = obj_list[0]
                 break
 
-    if not source_obj and len(object_names) >= 1:
-        source_obj = object_names[0]
-    if not target_obj and len(object_names) >= 2:
-        target_obj = object_names[1]
+    # NOTE: Removed dangerous fallback that picked first available object
+    # when expected class wasn't found. This caused "lucky" successes where
+    # YOLO misclassified the bowl but fallback still picked it.
+    # Now we return None to fail honestly rather than guess.
+
+    if not source_obj:
+        print(f"  ⚠ WARNING: No source object found matching task description")
+    if not target_obj:
+        print(f"  ⚠ WARNING: No target object found matching task description")
 
     return source_obj, target_obj
 
@@ -228,6 +295,21 @@ def run_episode_hardcoded(
         )
 
     source_obj, target_obj = parse_task_for_grounding(task_description, perc_result.object_names)
+
+    # Fail early if grounding failed (no matching object found)
+    if source_obj is None or target_obj is None:
+        print(f"  ✗ Grounding failed: source={source_obj}, target={target_obj}")
+        return EpisodeResult(
+            physical_success=False,
+            semantic_source_correct=False,
+            semantic_target_correct=False,
+            chosen_source_id=source_obj or "",
+            chosen_target_id=target_obj or "",
+            chosen_source_class="none",
+            chosen_target_class="none",
+            expected_source_class=expected_source_class or "",
+            expected_target_class=expected_target_class or "",
+        )
 
     # Check semantic correctness
     chosen_source_class = get_object_class(source_obj) if source_obj else "unknown"
@@ -687,6 +769,13 @@ def main():
         n_semantic_target = sum(1 for r in semantic_results if r["semantic_target_correct"])
         n_semantic_both = sum(1 for r in semantic_results if r["semantic_success"])
 
+        # Count "lucky" successes (physical success but semantic failure)
+        n_lucky = sum(1 for r in semantic_results
+                      if r["physical_success"] and not r["semantic_success"])
+        # Count grounding failures (no object found)
+        n_grounding_fail = sum(1 for r in semantic_results
+                               if r.get("chosen_source_class") == "none" or r.get("chosen_target_class") == "none")
+
         print("\n" + "-" * 60)
         print("SEMANTIC CORRECTNESS")
         print("-" * 60)
@@ -694,11 +783,13 @@ def main():
         print(f"Semantic Source Correct:   {100*n_semantic_source/n_semantic:.1f}% ({n_semantic_source}/{n_semantic})")
         print(f"Semantic Target Correct:   {100*n_semantic_target/n_semantic:.1f}% ({n_semantic_target}/{n_semantic})")
         print(f"Semantic Both Correct:     {100*n_semantic_both/n_semantic:.1f}% ({n_semantic_both}/{n_semantic})")
+        print(f"Lucky Success Rate:        {100*n_lucky/n_semantic:.1f}% ({n_lucky}/{n_semantic}) [physical ∧ ¬semantic]")
+        if n_grounding_fail > 0:
+            print(f"Grounding Failures:        {100*n_grounding_fail/n_semantic:.1f}% ({n_grounding_fail}/{n_semantic}) [no matching object]")
 
         # Check for dangerous case: high physical success but low semantic success
-        if n_physical_success > 0 and n_semantic_both < n_physical_success:
-            gap = n_physical_success - n_semantic_both
-            print(f"\n⚠ WARNING: {gap} episodes succeeded physically but with WRONG objects!")
+        if n_lucky > 0:
+            print(f"\n⚠ WARNING: {n_lucky} episodes succeeded physically but with WRONG objects!")
             print("   This means the robot did the manipulation correctly but on the wrong object.")
 
     # Print planner metrics for Qwen mode

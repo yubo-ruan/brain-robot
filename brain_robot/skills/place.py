@@ -108,6 +108,9 @@ class PlaceSkill(Skill):
                 info={"error_msg": "Failed to get gripper pose", "steps_taken": 0}
             )
 
+        # Ensure current_pose is numpy array
+        current_pose = np.array(current_pose) if not isinstance(current_pose, np.ndarray) else current_pose
+
         steps_taken = 0
         steps_per_phase = self.max_steps // 2
 
