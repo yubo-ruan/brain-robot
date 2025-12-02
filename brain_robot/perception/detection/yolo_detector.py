@@ -46,6 +46,13 @@ class YOLOObjectDetector(ObjectDetector):
     iou_threshold: float = 0.45  # For NMS
     device: str = "cuda"
 
+    # Class-specific confidence thresholds (override default for specific classes)
+    # Bowl detections have lower confidence due to dark color and training data
+    class_confidence_thresholds: Dict[str, float] = field(default_factory=lambda: {
+        "bowl": 0.15,  # Lower threshold for bowls (they typically have 0.2-0.3 confidence)
+        "ramekin": 0.25,  # Similar issue with small objects
+    })
+
     # Classes this detector recognizes
     CLASSES: List[str] = field(default_factory=lambda: LIBERO_CLASSES.copy())
 
@@ -101,10 +108,17 @@ class YOLOObjectDetector(ObjectDetector):
         if self._model is None:
             raise RuntimeError("Model not loaded. Call load_model() first.")
 
-        # Run inference
+        # Use minimum of all thresholds to get all potential detections
+        # Then filter by class-specific thresholds
+        min_threshold = min(
+            self.confidence_threshold,
+            *self.class_confidence_thresholds.values()
+        )
+
+        # Run inference with low threshold
         results = self._model(
             rgb_image,
-            conf=self.confidence_threshold,
+            conf=min_threshold,
             iou=self.iou_threshold,
             verbose=False,
         )
@@ -119,11 +133,18 @@ class YOLOObjectDetector(ObjectDetector):
                     class_id = int(box.cls.item())
                     class_name = self._class_map.get(class_id, f"class_{class_id}")
 
-                    # Get bbox in xyxy format
-                    bbox = box.xyxy[0].cpu().numpy().tolist()
-
                     # Get confidence
                     confidence = float(box.conf.item())
+
+                    # Apply class-specific threshold
+                    threshold = self.class_confidence_thresholds.get(
+                        class_name, self.confidence_threshold
+                    )
+                    if confidence < threshold:
+                        continue
+
+                    # Get bbox in xyxy format
+                    bbox = box.xyxy[0].cpu().numpy().tolist()
 
                     # Create detection (position will be estimated by tracker/pose)
                     det = Detection(

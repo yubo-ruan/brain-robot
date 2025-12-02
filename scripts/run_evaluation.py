@@ -1,15 +1,20 @@
-"""Unified evaluation script supporting Phase 1, 2, and 3 modes.
+"""Unified evaluation script supporting Phase 1, 2, 3, and 4 modes.
 
 Modes:
 - hardcoded: Phase 1 baseline with hardcoded skill sequence
 - qwen: Phase 2 with Qwen skill planning
 - qwen_grounded: Phase 3 with Qwen semantic grounding + skill planning
+
+Perception:
+- oracle: Ground truth from simulator (default)
+- learned: YOLO detection + depth-based pose estimation (Phase 4)
 """
 
 import argparse
 import json
 import os
 import sys
+from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 
@@ -20,6 +25,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
 
 from brain_robot.config import RunConfig, SkillConfig, PerceptionConfig, LoggingConfig
 from brain_robot.perception.oracle import OraclePerception
+from brain_robot.perception.learned import LearnedPerception
 from brain_robot.world_model.state import WorldState
 from brain_robot.skills import ApproachSkill, GraspSkill, MoveSkill, PlaceSkill
 from brain_robot.logging.episode_logger import EpisodeLogger, RunSummary
@@ -52,6 +58,64 @@ def make_libero_env(task_suite: str, task_id: int):
     env.task_name = task.name
 
     return env, task.language
+
+
+def extract_expected_classes(task_description: str) -> tuple:
+    """Extract expected source and target class from task description.
+
+    Returns:
+        (expected_source_class, expected_target_class) - strings like "bowl", "plate"
+    """
+    task_lower = task_description.lower()
+
+    # Known object classes
+    OBJECT_CLASSES = ['bowl', 'plate', 'mug', 'ramekin', 'drawer', 'cabinet', 'cookie_box', 'can', 'bottle', 'stove']
+
+    expected_source = None
+    expected_target = None
+
+    # Find source class from task
+    source_keywords = ['pick up the', 'pick the', 'grab the', 'take the']
+    for kw in source_keywords:
+        if kw in task_lower:
+            rest = task_lower.split(kw)[1]
+            words = rest.split()[:5]  # Look at first 5 words
+            for cls in OBJECT_CLASSES:
+                if cls in ' '.join(words):
+                    expected_source = cls
+                    break
+            break
+
+    # Find target class from task
+    target_keywords = ['place it on the', 'place it in the', 'put it on the', 'put it in the',
+                       'place on the', 'place in the', 'on the', 'in the', 'into the']
+    for kw in target_keywords:
+        if kw in task_lower:
+            rest = task_lower.split(kw)[-1]
+            words = rest.split()[:5]
+            for cls in OBJECT_CLASSES:
+                if cls in ' '.join(words):
+                    expected_target = cls
+                    break
+            break
+
+    return expected_source, expected_target
+
+
+def get_object_class(obj_id: str) -> str:
+    """Extract class name from object ID.
+
+    Handles both oracle IDs (akita_black_bowl_1_main) and learned IDs (bowl_0_learned).
+    """
+    obj_lower = obj_id.lower()
+
+    # Check for known classes in order (more specific first)
+    OBJECT_CLASSES = ['cookie_box', 'ramekin', 'cabinet', 'drawer', 'bottle', 'stove', 'bowl', 'plate', 'mug', 'can']
+    for cls in OBJECT_CLASSES:
+        if cls in obj_lower:
+            return cls
+
+    return "unknown"
 
 
 def parse_task_for_grounding(task_description: str, object_names: list) -> tuple:
@@ -119,6 +183,25 @@ def parse_task_for_grounding(task_description: str, object_names: list) -> tuple
     return source_obj, target_obj
 
 
+@dataclass
+class EpisodeResult:
+    """Result of a single episode with both physical and semantic success."""
+    physical_success: bool
+    semantic_source_correct: bool
+    semantic_target_correct: bool
+    chosen_source_id: str = ""
+    chosen_target_id: str = ""
+    chosen_source_class: str = ""
+    chosen_target_class: str = ""
+    expected_source_class: str = ""
+    expected_target_class: str = ""
+
+    @property
+    def semantic_success(self) -> bool:
+        """Both source and target must be semantically correct."""
+        return self.semantic_source_correct and self.semantic_target_correct
+
+
 def run_episode_hardcoded(
     env,
     task_description: str,
@@ -126,19 +209,34 @@ def run_episode_hardcoded(
     perception: OraclePerception,
     config: SkillConfig,
     logger: EpisodeLogger,
-) -> bool:
+) -> EpisodeResult:
     """Run episode with hardcoded skill sequence (Phase 1 baseline)."""
     perc_result = perception.perceive(env)
     world_state.update_from_perception(perc_result)
     logger.log_world_state(world_state)
 
+    # Extract expected classes from task
+    expected_source_class, expected_target_class = extract_expected_classes(task_description)
+
     if len(perc_result.object_names) < 2:
-        return False
+        return EpisodeResult(
+            physical_success=False,
+            semantic_source_correct=False,
+            semantic_target_correct=False,
+            expected_source_class=expected_source_class or "",
+            expected_target_class=expected_target_class or "",
+        )
 
     source_obj, target_obj = parse_task_for_grounding(task_description, perc_result.object_names)
 
-    print(f"  Source: {source_obj}")
-    print(f"  Target: {target_obj}")
+    # Check semantic correctness
+    chosen_source_class = get_object_class(source_obj) if source_obj else "unknown"
+    chosen_target_class = get_object_class(target_obj) if target_obj else "unknown"
+    semantic_source_correct = (chosen_source_class == expected_source_class) if expected_source_class else True
+    semantic_target_correct = (chosen_target_class == expected_target_class) if expected_target_class else True
+
+    print(f"  Source: {source_obj} (class={chosen_source_class}, expected={expected_source_class})")
+    print(f"  Target: {target_obj} (class={chosen_target_class}, expected={expected_target_class})")
 
     skills = [
         (ApproachSkill(config=config), {"obj": source_obj}),
@@ -165,12 +263,32 @@ def run_episode_hardcoded(
 
         if not result.success:
             print(f"  {skill.name} failed: {result.info.get('error_msg', 'Unknown')}")
-            return False
+            return EpisodeResult(
+                physical_success=False,
+                semantic_source_correct=semantic_source_correct,
+                semantic_target_correct=semantic_target_correct,
+                chosen_source_id=source_obj or "",
+                chosen_target_id=target_obj or "",
+                chosen_source_class=chosen_source_class,
+                chosen_target_class=chosen_target_class,
+                expected_source_class=expected_source_class or "",
+                expected_target_class=expected_target_class or "",
+            )
 
         print(f"  {skill.name}: OK ({result.info.get('steps_taken', 0)} steps)")
 
     print(f"  Total steps: {step_count}")
-    return True
+    return EpisodeResult(
+        physical_success=True,
+        semantic_source_correct=semantic_source_correct,
+        semantic_target_correct=semantic_target_correct,
+        chosen_source_id=source_obj or "",
+        chosen_target_id=target_obj or "",
+        chosen_source_class=chosen_source_class,
+        chosen_target_class=chosen_target_class,
+        expected_source_class=expected_source_class or "",
+        expected_target_class=expected_target_class or "",
+    )
 
 
 def run_episode_qwen(
@@ -331,12 +449,24 @@ def main():
     parser = argparse.ArgumentParser(description="Unified Evaluation (Phase 1, 2 & 3)")
     parser.add_argument("--mode", type=str, choices=["hardcoded", "qwen", "qwen_grounded"], default="hardcoded",
                         help="Planning mode: hardcoded (Phase 1), qwen (Phase 2), or qwen_grounded (Phase 3)")
+    parser.add_argument("--perception", type=str, choices=["oracle", "learned"], default="oracle",
+                        help="Perception mode: oracle (ground truth) or learned (YOLO + depth)")
+    parser.add_argument("--bootstrap", type=str, choices=["oracle", "cold"], default="oracle",
+                        help="Bootstrap mode for learned perception: oracle (use GT at t=0) or cold (detection only)")
+    parser.add_argument("--model-path", type=str, default="models/yolo_libero.pt",
+                        help="Path to YOLO model (only used with --perception learned)")
     parser.add_argument("--task-suite", type=str, default="libero_spatial")
     parser.add_argument("--task-id", type=int, default=0)
     parser.add_argument("--n-episodes", type=int, default=20)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--output-dir", type=str, default="logs/evaluation")
     args = parser.parse_args()
+
+    # Validate model path for learned perception
+    if args.perception == "learned" and not Path(args.model_path).exists():
+        print(f"Error: YOLO model not found at {args.model_path}")
+        print("Train a model first with: python scripts/train_yolo_detector.py")
+        return 1
 
     # Create config
     config = RunConfig(
@@ -345,18 +475,26 @@ def main():
         task_id=args.task_id,
         n_episodes=args.n_episodes,
         skill=SkillConfig(),
-        perception=PerceptionConfig(use_oracle=True),
+        perception=PerceptionConfig(use_oracle=(args.perception == "oracle")),
         logging=LoggingConfig(output_dir=args.output_dir),
     )
 
     # Setup output directory
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    output_dir = Path(args.output_dir) / f"{args.mode}_{timestamp}"
+    perception_suffix = f"_{args.perception}" if args.perception != "oracle" else ""
+    bootstrap_suffix = f"_{args.bootstrap}" if args.perception == "learned" and args.bootstrap != "oracle" else ""
+    output_dir = Path(args.output_dir) / f"{args.mode}{perception_suffix}{bootstrap_suffix}_{timestamp}"
     output_dir.mkdir(parents=True, exist_ok=True)
 
     # Save config
     with open(output_dir / "config.json", "w") as f:
-        json.dump({"mode": args.mode, **config.to_dict()}, f, indent=2)
+        json.dump({
+            "mode": args.mode,
+            "perception": args.perception,
+            "bootstrap": args.bootstrap if args.perception == "learned" else None,
+            "model_path": args.model_path if args.perception == "learned" else None,
+            **config.to_dict()
+        }, f, indent=2)
 
     phase_names = {
         "hardcoded": "Phase 1 (Hardcoded)",
@@ -364,11 +502,16 @@ def main():
         "qwen_grounded": "Phase 3 (Qwen Grounding)",
     }
     phase_name = phase_names.get(args.mode, args.mode)
+    perception_name = "Learned (YOLO+Depth)" if args.perception == "learned" else "Oracle"
 
     print("=" * 60)
     print(f"Evaluation: {phase_name}")
     print("=" * 60)
     print(f"Mode: {args.mode}")
+    print(f"Perception: {perception_name}")
+    if args.perception == "learned":
+        print(f"Model: {args.model_path}")
+        print(f"Bootstrap: {args.bootstrap}")
     print(f"Task Suite: {args.task_suite}")
     print(f"Task ID: {args.task_id}")
     print(f"Episodes: {args.n_episodes}")
@@ -381,8 +524,21 @@ def main():
     env, task_description = make_libero_env(args.task_suite, args.task_id)
     print(f"Task: {task_description}")
 
-    # Setup components
-    perception = OraclePerception()
+    # Setup perception
+    oracle_perception = OraclePerception()  # Always need oracle for bootstrap/reference
+
+    if args.perception == "learned":
+        learned_perception = LearnedPerception(
+            model_path=args.model_path,
+            confidence_threshold=0.5,
+            image_size=(256, 256),
+        )
+        print("Warming up YOLO detector...")
+        learned_perception.detector.warmup()
+        perception = learned_perception
+    else:
+        perception = oracle_perception
+
     logger = EpisodeLogger(str(output_dir), config=config)
 
     # Setup planner/grounder and metrics based on mode
@@ -402,6 +558,7 @@ def main():
 
     # Run episodes
     successes = 0
+    semantic_results = []  # Track semantic correctness per episode
     task_id_str = f"{args.task_suite}_{args.task_id}"
 
     for episode_idx in range(args.n_episodes):
@@ -413,6 +570,15 @@ def main():
         env.reset()
         world_state = WorldState()
 
+        # Bootstrap learned perception at episode start
+        if args.perception == "learned":
+            learned_perception.reset()
+            if args.bootstrap == "oracle":
+                oracle_result = oracle_perception.perceive(env)
+                learned_perception.bootstrap_from_oracle(oracle_result, env)
+            else:  # cold start
+                learned_perception.bootstrap_from_detections(env)
+
         logger.start_episode(
             task=task_description,
             task_id=args.task_id,
@@ -420,9 +586,12 @@ def main():
             seed=episode_seed,
         )
 
+        # Track semantic success separately
+        episode_result = None
+
         try:
             if args.mode == "hardcoded":
-                success = run_episode_hardcoded(
+                episode_result = run_episode_hardcoded(
                     env=env,
                     task_description=task_description,
                     world_state=world_state,
@@ -430,6 +599,7 @@ def main():
                     config=config.skill,
                     logger=logger,
                 )
+                success = episode_result.physical_success
             elif args.mode == "qwen":
                 success = run_episode_qwen(
                     env=env,
@@ -471,6 +641,27 @@ def main():
         else:
             print(f"  Result: FAILURE")
 
+        # Track semantic metrics for hardcoded mode
+        if episode_result is not None:
+            semantic_results.append({
+                "episode": episode_idx,
+                "physical_success": episode_result.physical_success,
+                "semantic_source_correct": episode_result.semantic_source_correct,
+                "semantic_target_correct": episode_result.semantic_target_correct,
+                "semantic_success": episode_result.semantic_success,
+                "chosen_source_id": episode_result.chosen_source_id,
+                "chosen_target_id": episode_result.chosen_target_id,
+                "chosen_source_class": episode_result.chosen_source_class,
+                "chosen_target_class": episode_result.chosen_target_class,
+                "expected_source_class": episode_result.expected_source_class,
+                "expected_target_class": episode_result.expected_target_class,
+            })
+
+            if not episode_result.semantic_source_correct:
+                print(f"  ⚠ SEMANTIC ERROR: source is {episode_result.chosen_source_class}, expected {episode_result.expected_source_class}")
+            if not episode_result.semantic_target_correct:
+                print(f"  ⚠ SEMANTIC ERROR: target is {episode_result.chosen_target_class}, expected {episode_result.expected_target_class}")
+
     # Final summary
     success_rate = successes / args.n_episodes
 
@@ -487,6 +678,28 @@ def main():
         print("\n✓ SUCCESS CRITERIA MET")
     else:
         print(f"\n✗ Below target ({success_rate:.1%} < {config.success_rate_threshold:.1%})")
+
+    # Print semantic metrics if available
+    if semantic_results:
+        n_semantic = len(semantic_results)
+        n_physical_success = sum(1 for r in semantic_results if r["physical_success"])
+        n_semantic_source = sum(1 for r in semantic_results if r["semantic_source_correct"])
+        n_semantic_target = sum(1 for r in semantic_results if r["semantic_target_correct"])
+        n_semantic_both = sum(1 for r in semantic_results if r["semantic_success"])
+
+        print("\n" + "-" * 60)
+        print("SEMANTIC CORRECTNESS")
+        print("-" * 60)
+        print(f"Physical Success Rate:     {100*n_physical_success/n_semantic:.1f}% ({n_physical_success}/{n_semantic})")
+        print(f"Semantic Source Correct:   {100*n_semantic_source/n_semantic:.1f}% ({n_semantic_source}/{n_semantic})")
+        print(f"Semantic Target Correct:   {100*n_semantic_target/n_semantic:.1f}% ({n_semantic_target}/{n_semantic})")
+        print(f"Semantic Both Correct:     {100*n_semantic_both/n_semantic:.1f}% ({n_semantic_both}/{n_semantic})")
+
+        # Check for dangerous case: high physical success but low semantic success
+        if n_physical_success > 0 and n_semantic_both < n_physical_success:
+            gap = n_physical_success - n_semantic_both
+            print(f"\n⚠ WARNING: {gap} episodes succeeded physically but with WRONG objects!")
+            print("   This means the robot did the manipulation correctly but on the wrong object.")
 
     # Print planner metrics for Qwen mode
     if metrics:
@@ -509,6 +722,9 @@ def main():
     # Save final summary
     summary = {
         "mode": args.mode,
+        "perception": args.perception,
+        "bootstrap": args.bootstrap if args.perception == "learned" else None,
+        "model_path": args.model_path if args.perception == "learned" else None,
         "task_suite": args.task_suite,
         "task_id": args.task_id,
         "task_description": task_description,
@@ -520,6 +736,17 @@ def main():
         "config": config.to_dict(),
         "git_info": get_git_info(),
     }
+
+    # Add semantic metrics
+    if semantic_results:
+        n_semantic = len(semantic_results)
+        summary["semantic_metrics"] = {
+            "physical_success_rate": sum(1 for r in semantic_results if r["physical_success"]) / n_semantic,
+            "semantic_source_correct_rate": sum(1 for r in semantic_results if r["semantic_source_correct"]) / n_semantic,
+            "semantic_target_correct_rate": sum(1 for r in semantic_results if r["semantic_target_correct"]) / n_semantic,
+            "semantic_both_correct_rate": sum(1 for r in semantic_results if r["semantic_success"]) / n_semantic,
+        }
+        summary["semantic_results"] = semantic_results
 
     if metrics:
         summary["planner_metrics"] = metrics.summary()
