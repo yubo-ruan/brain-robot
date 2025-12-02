@@ -226,6 +226,7 @@ class QwenSkillPlanner:
         metrics: Optional[PlannerMetrics] = None,
         task_id: str = "unknown",
         logger=None,
+        perception=None,
     ) -> Tuple[bool, Dict[str, Any]]:
         """Execute a skill plan.
 
@@ -237,6 +238,7 @@ class QwenSkillPlanner:
             metrics: Optional metrics tracker
             task_id: Task identifier
             logger: Optional episode logger
+            perception: Optional perception module for updates between skills
 
         Returns:
             (success, info) tuple
@@ -249,6 +251,11 @@ class QwenSkillPlanner:
         for i, step in enumerate(plan):
             skill_name = step["skill"]
             args = step.get("args", {})
+
+            # Update perception before each skill (critical for accuracy)
+            if perception is not None:
+                perc_result = perception.perceive(env)
+                world_state.update_from_perception(perc_result)
 
             # Get skill instance
             skill = get_skill_by_name(skill_name, config)

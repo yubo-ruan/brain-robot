@@ -224,6 +224,7 @@ def run_episode_qwen(
         metrics=metrics,
         task_id=task_id,
         logger=logger,
+        perception=perception,
     )
 
     if success:
