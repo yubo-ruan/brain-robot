@@ -52,6 +52,89 @@ def make_libero_env(task_suite: str, task_id: int):
     return env, task.language
 
 
+def parse_task_for_grounding(task_description: str, object_names: list) -> tuple:
+    """Simple task parsing to find source and target objects.
+
+    This is a minimal Phase 1 heuristic. Phase 3 will use Qwen for this.
+
+    Args:
+        task_description: Natural language task (e.g., "pick up the black bowl and place it on the plate")
+        object_names: List of object IDs from perception
+
+    Returns:
+        (source_obj, target_obj) tuple
+    """
+    task_lower = task_description.lower()
+
+    # Build a mapping from object types to object IDs
+    object_types = {}
+    for obj_id in object_names:
+        obj_lower = obj_id.lower()
+        # Extract type keywords
+        if 'bowl' in obj_lower:
+            object_types.setdefault('bowl', []).append(obj_id)
+        if 'plate' in obj_lower and 'burner' not in obj_lower:  # Exclude stove burner plate
+            object_types.setdefault('plate', []).append(obj_id)
+        if 'ramekin' in obj_lower:
+            object_types.setdefault('ramekin', []).append(obj_id)
+        if 'mug' in obj_lower:
+            object_types.setdefault('mug', []).append(obj_id)
+        if 'drawer' in obj_lower:
+            object_types.setdefault('drawer', []).append(obj_id)
+        if 'cabinet' in obj_lower:
+            object_types.setdefault('cabinet', []).append(obj_id)
+
+    source_obj = None
+    target_obj = None
+
+    # Parse task for source: "pick up the X" pattern
+    source_keywords = ['pick up the', 'pick the', 'grab the', 'take the']
+    for kw in source_keywords:
+        if kw in task_lower:
+            # Find what comes after
+            rest = task_lower.split(kw)[1]
+            for obj_type, obj_list in object_types.items():
+                if obj_type in rest.split()[0:3]:  # Check first 3 words
+                    source_obj = obj_list[0]  # Take first matching object
+                    break
+            if source_obj:
+                break
+
+    # Parse task for target: "place it on/in the X" pattern
+    target_keywords = ['place it on the', 'place it in the', 'put it on the', 'put it in the',
+                       'place on the', 'place in the', 'on the', 'in the', 'into the']
+    for kw in target_keywords:
+        if kw in task_lower:
+            rest = task_lower.split(kw)[-1]  # Take last occurrence
+            for obj_type, obj_list in object_types.items():
+                if obj_type in rest.split()[0:3]:
+                    target_obj = obj_list[0]
+                    break
+            if target_obj:
+                break
+
+    # Fallback: if no target found but we have source, look for different object type
+    if source_obj and not target_obj:
+        source_type = None
+        for obj_type, obj_list in object_types.items():
+            if source_obj in obj_list:
+                source_type = obj_type
+                break
+        # Pick first object of different type
+        for obj_type, obj_list in object_types.items():
+            if obj_type != source_type:
+                target_obj = obj_list[0]
+                break
+
+    # Final fallback: first two objects
+    if not source_obj and len(object_names) >= 1:
+        source_obj = object_names[0]
+    if not target_obj and len(object_names) >= 2:
+        target_obj = object_names[1]
+
+    return source_obj, target_obj
+
+
 def run_episode(
     env,
     task_description: str,
@@ -61,7 +144,7 @@ def run_episode(
     logger: EpisodeLogger,
 ) -> bool:
     """Run a single episode with hardcoded skill sequence.
-    
+
     Returns:
         True if episode succeeded.
     """
@@ -69,14 +152,12 @@ def run_episode(
     perc_result = perception.perceive(env)
     world_state.update_from_perception(perc_result)
     logger.log_world_state(world_state)
-    
-    # Determine source and target from objects
-    # For Phase 1, we use simple heuristics
+
+    # Determine source and target from task description
     if len(perc_result.object_names) < 2:
         return False
-    
-    source_obj = perc_result.object_names[0]
-    target_obj = perc_result.object_names[1]
+
+    source_obj, target_obj = parse_task_for_grounding(task_description, perc_result.object_names)
     
     print(f"  Source: {source_obj}")
     print(f"  Target: {target_obj}")

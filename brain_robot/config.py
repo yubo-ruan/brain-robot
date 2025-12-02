@@ -23,7 +23,7 @@ class SkillConfig:
     grasp_close_threshold: float = 0.01  # Gripper width indicating closed
 
     # Move skill
-    move_max_steps: int = 300  # Increased for multi-phase moves
+    move_max_steps: int = 400  # Increased for longer translations
     move_pos_threshold: float = 0.05  # 5cm (slightly more relaxed)
 
     # Place skill

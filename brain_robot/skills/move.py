@@ -134,35 +134,39 @@ class MoveSkill(Skill):
             )
 
         steps_taken = 0
-        steps_per_phase = self.max_steps // 3
 
-        # Phase 1: Move up to safe height
-        up_target = current_pose.copy()
-        up_target[2] = max(current_pose[2], self.move_height)
-        self.controller.set_target(up_target, gripper=-1.0)  # Keep closed
+        # Dynamic step allocation: lift needs fewer steps than translate
+        lift_budget = min(50, self.max_steps // 6)  # Quick lift
+        translate_budget = self.max_steps - lift_budget  # Rest for translation
 
-        for step in range(steps_per_phase):
-            steps_taken += 1
-            if current_pose is None:
-                break
+        # Phase 1: Move up to safe height (if needed)
+        if current_pose[2] < self.move_height - 0.02:
+            up_target = current_pose.copy()
+            up_target[2] = self.move_height
+            self.controller.set_target(up_target, gripper=-1.0)  # Keep closed
 
-            if self.controller.is_at_target(current_pose, pos_threshold=0.02, ori_threshold=3.0):
-                break
+            for step in range(lift_budget):
+                steps_taken += 1
+                if current_pose is None:
+                    break
 
-            action = self.controller.compute_action(current_pose)
-            obs, _, _, _ = self._step_env(env, action)
-            current_pose = self._get_gripper_pose(env, obs)
-            last_obs = obs
+                if self.controller.is_at_target(current_pose, pos_threshold=0.02, ori_threshold=3.0):
+                    break
 
-        # Phase 2: Translate to above target
+                action = self.controller.compute_action(current_pose)
+                obs, _, _, _ = self._step_env(env, action)
+                current_pose = self._get_gripper_pose(env, obs)
+                last_obs = obs
+
+        # Phase 2: Translate to above target (gets most of the step budget)
         if current_pose is not None:
             above_target = current_pose.copy()
             above_target[0] = target_pos[0]
             above_target[1] = target_pos[1]
-            above_target[2] = self.move_height
+            above_target[2] = max(current_pose[2], self.move_height)  # Maintain height
             self.controller.set_target(above_target, gripper=-1.0)
 
-            for step in range(steps_per_phase):
+            for step in range(translate_budget):
                 steps_taken += 1
                 if current_pose is None:
                     break
