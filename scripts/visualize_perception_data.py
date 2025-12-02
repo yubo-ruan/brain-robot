@@ -159,15 +159,30 @@ def compute_dataset_statistics(data_dir: Path, split: str = "train") -> dict:
         "spatial_inside_counts": defaultdict(int),
         "missing_bboxes": 0,
         "total_objects": 0,
+        # Per-task breakdown
+        "per_task": defaultdict(lambda: {
+            "n_frames": 0,
+            "n_episodes": set(),
+            "class_counts": defaultdict(int),
+            "bbox_sizes": [],
+        }),
     }
 
     for frame in frames:
+        task_id = frame["task_id"]
+        episode_key = (task_id, frame["episode_idx"])
+
+        # Per-task stats
+        all_stats["per_task"][task_id]["n_frames"] += 1
+        all_stats["per_task"][task_id]["n_episodes"].add(episode_key)
+
         for obj_id, obj_data in frame["objects"].items():
             obj_class = obj_data.get("class", "unknown")
             bbox = obj_data.get("bbox", [])
 
             all_stats["total_objects"] += 1
             all_stats["class_counts"][obj_class] += 1
+            all_stats["per_task"][task_id]["class_counts"][obj_class] += 1
 
             if bbox and len(bbox) == 4:
                 x1, y1, x2, y2 = bbox
@@ -175,6 +190,7 @@ def compute_dataset_statistics(data_dir: Path, split: str = "train") -> dict:
                 height = y2 - y1
                 if width > 0 and height > 0:
                     all_stats["bbox_sizes_by_class"][obj_class].append(min(width, height))
+                    all_stats["per_task"][task_id]["bbox_sizes"].append(min(width, height))
             else:
                 all_stats["missing_bboxes"] += 1
 
@@ -183,6 +199,12 @@ def compute_dataset_statistics(data_dir: Path, split: str = "train") -> dict:
             all_stats["spatial_on_counts"][surface] += 1
         for obj, container in frame.get("inside_relations", {}).items():
             all_stats["spatial_inside_counts"][container] += 1
+
+    # Convert episode sets to counts
+    for task_id in all_stats["per_task"]:
+        all_stats["per_task"][task_id]["n_episodes"] = len(
+            all_stats["per_task"][task_id]["n_episodes"]
+        )
 
     return all_stats
 
@@ -197,6 +219,26 @@ def print_statistics(stats: dict, split: str):
     print(f"Episodes: {stats['n_episodes']}")
     print(f"Total objects: {stats['total_objects']}")
     print(f"Missing bboxes: {stats['missing_bboxes']}")
+
+    # Per-task breakdown
+    if stats.get("per_task"):
+        print(f"\n--- Per-Task Breakdown ---")
+        for task_id in sorted(stats["per_task"].keys()):
+            task_stats = stats["per_task"][task_id]
+            n_frames = task_stats["n_frames"]
+            n_episodes = task_stats["n_episodes"]
+            classes = list(task_stats["class_counts"].keys())
+            bbox_sizes = task_stats["bbox_sizes"]
+
+            # Compute bbox stats
+            bbox_info = ""
+            if bbox_sizes:
+                min_bb = min(bbox_sizes)
+                avg_bb = sum(bbox_sizes) / len(bbox_sizes)
+                bbox_info = f", bbox: {min_bb:.0f}-{avg_bb:.0f}px"
+
+            print(f"  Task {task_id}: {n_frames} frames, {n_episodes} episodes, "
+                  f"classes: {classes}{bbox_info}")
 
     print(f"\nClass distribution:")
     for cls, count in sorted(stats["class_counts"].items(), key=lambda x: -x[1]):

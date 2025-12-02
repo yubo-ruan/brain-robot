@@ -680,6 +680,39 @@ def evaluate_learned_perception(
 
 ---
 
+## Implementation Status
+
+### Phase 4.1: Data Collection ✅ COMPLETE
+- Implemented `PerceptionDataCollector` with episode-level train/val splits
+- Implemented `KeyframeSelector` for efficient sampling
+- Collected 2040 frames across 6 LIBERO spatial tasks (120 episodes)
+- Dataset saved to `data/perception_v1/` with `train.json`, `val.json`, and `images/`
+
+### Phase 4.2: Object Detection 🔄 IN PROGRESS
+- Implemented tracker interface (`brain_robot/perception/tracking/`)
+  - `Detection` dataclass for detector outputs
+  - `ObjectTrack` dataclass for persistent tracks
+  - `NearestNeighborTracker` for 3D position-based association
+- Implemented `YOLOObjectDetector` class
+- Created YOLO format dataset converter (`scripts/convert_to_yolo_format.py`)
+- Created training script (`scripts/train_yolo_detector.py`)
+- Created evaluation script (`scripts/eval_yolo_detector.py`)
+
+**Environment Note**: YOLO training requires compatible torch/torchvision versions.
+If you encounter NMS errors, ensure matching versions:
+```bash
+pip install torch==2.1.0 torchvision==0.16.0
+pip install ultralytics
+```
+
+### Phase 4.3-4.6: TODO
+- Pose estimation module
+- Spatial relation inference
+- Gripper state estimation
+- Full integration and testing
+
+---
+
 ## Risk Mitigation
 
 ### Risk: Detection misses key objects
