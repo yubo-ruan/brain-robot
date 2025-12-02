@@ -1,8 +1,9 @@
-"""Unified evaluation script supporting both Phase 1 and Phase 2 modes.
+"""Unified evaluation script supporting Phase 1, 2, and 3 modes.
 
 Modes:
 - hardcoded: Phase 1 baseline with hardcoded skill sequence
 - qwen: Phase 2 with Qwen skill planning
+- qwen_grounded: Phase 3 with Qwen semantic grounding + skill planning
 """
 
 import argparse
@@ -237,10 +238,99 @@ def run_episode_qwen(
     return success
 
 
+def run_episode_qwen_grounded(
+    env,
+    task_description: str,
+    world_state: WorldState,
+    perception: OraclePerception,
+    config: SkillConfig,
+    logger: EpisodeLogger,
+    grounder,
+    grounding_metrics,
+    task_id: str,
+) -> bool:
+    """Run episode with Qwen semantic grounding + hardcoded skill sequence (Phase 3).
+
+    This mode uses Qwen to ground the task language to object IDs,
+    then executes a deterministic skill sequence.
+    """
+    from brain_robot.grounding.enriched_object import enrich_objects
+
+    # Get initial perception
+    perc_result = perception.perceive(env)
+    world_state.update_from_perception(perc_result)
+    logger.log_world_state(world_state)
+
+    if len(perc_result.object_names) < 2:
+        return False
+
+    # Enrich objects with human-readable descriptions
+    enriched = enrich_objects(world_state)
+
+    # Ground task to object IDs using Qwen
+    print("  Grounding with Qwen...")
+    grounding_result = grounder.ground(
+        task_description=task_description,
+        objects=enriched,
+        metrics=grounding_metrics,
+        task_id=task_id,
+    )
+
+    if not grounding_result.valid:
+        print(f"  Grounding failed: {grounding_result.error}")
+        return False
+
+    source_obj = grounding_result.source_object
+    target_obj = grounding_result.target_location
+
+    print(f"  Grounded: source={source_obj}, target={target_obj}")
+    print(f"  Confidence: {grounding_result.confidence}")
+    if grounding_result.ambiguous:
+        print(f"  WARNING: Ambiguous grounding! Alternatives: {grounding_result.alternative_sources}")
+
+    # Log grounding interaction
+    if grounding_result.prompt and grounding_result.raw_output:
+        logger.log_qwen(grounding_result.prompt, grounding_result.raw_output)
+
+    # Execute deterministic skill sequence with grounded objects
+    skills = [
+        (ApproachSkill(config=config), {"obj": source_obj}),
+        (GraspSkill(config=config), {"obj": source_obj}),
+        (MoveSkill(config=config), {"obj": source_obj, "region": target_obj}),
+        (PlaceSkill(config=config), {"obj": source_obj, "region": target_obj}),
+    ]
+
+    step_count = 0
+
+    for skill, args in skills:
+        # Update perception before each skill
+        with logger.get_timer().measure("perception"):
+            perc_result = perception.perceive(env)
+            world_state.update_from_perception(perc_result)
+
+        skill_timer_name = f"skill_{skill.name}"
+        with logger.get_timer().measure(skill_timer_name):
+            result = skill.run(env, world_state, args)
+
+        logger.log_skill(skill.name, args, result)
+        logger.log_world_state(world_state)
+
+        step_count += result.info.get("steps_taken", 0)
+
+        if not result.success:
+            print(f"  {skill.name} failed: {result.info.get('error_msg', 'Unknown')}")
+            return False
+
+        print(f"  {skill.name}: OK ({result.info.get('steps_taken', 0)} steps)")
+
+    print(f"  Total steps: {step_count}")
+    return True
+
+
 def main():
-    parser = argparse.ArgumentParser(description="Unified Evaluation (Phase 1 & 2)")
-    parser.add_argument("--mode", type=str, choices=["hardcoded", "qwen"], default="hardcoded",
-                        help="Planning mode: hardcoded (Phase 1) or qwen (Phase 2)")
+    parser = argparse.ArgumentParser(description="Unified Evaluation (Phase 1, 2 & 3)")
+    parser.add_argument("--mode", type=str, choices=["hardcoded", "qwen", "qwen_grounded"], default="hardcoded",
+                        help="Planning mode: hardcoded (Phase 1), qwen (Phase 2), or qwen_grounded (Phase 3)")
     parser.add_argument("--task-suite", type=str, default="libero_spatial")
     parser.add_argument("--task-id", type=int, default=0)
     parser.add_argument("--n-episodes", type=int, default=20)
@@ -268,7 +358,12 @@ def main():
     with open(output_dir / "config.json", "w") as f:
         json.dump({"mode": args.mode, **config.to_dict()}, f, indent=2)
 
-    phase_name = "Phase 1 (Hardcoded)" if args.mode == "hardcoded" else "Phase 2 (Qwen Planning)"
+    phase_names = {
+        "hardcoded": "Phase 1 (Hardcoded)",
+        "qwen": "Phase 2 (Qwen Planning)",
+        "qwen_grounded": "Phase 3 (Qwen Grounding)",
+    }
+    phase_name = phase_names.get(args.mode, args.mode)
 
     print("=" * 60)
     print(f"Evaluation: {phase_name}")
@@ -290,13 +385,20 @@ def main():
     perception = OraclePerception()
     logger = EpisodeLogger(str(output_dir), config=config)
 
-    # Setup planner and metrics for Qwen mode
+    # Setup planner/grounder and metrics based on mode
     planner = None
     metrics = None
+    grounder = None
+    grounding_metrics = None
+
     if args.mode == "qwen":
         from brain_robot.planning import QwenSkillPlanner, PlannerMetrics
         planner = QwenSkillPlanner(temperature=0.1, max_retries=2)
         metrics = PlannerMetrics()
+    elif args.mode == "qwen_grounded":
+        from brain_robot.grounding import QwenSemanticGrounder, GroundingMetrics
+        grounder = QwenSemanticGrounder(temperature=0.1, max_retries=2)
+        grounding_metrics = GroundingMetrics()
 
     # Run episodes
     successes = 0
@@ -328,7 +430,7 @@ def main():
                     config=config.skill,
                     logger=logger,
                 )
-            else:
+            elif args.mode == "qwen":
                 success = run_episode_qwen(
                     env=env,
                     task_description=task_description,
@@ -338,6 +440,18 @@ def main():
                     logger=logger,
                     planner=planner,
                     metrics=metrics,
+                    task_id=task_id_str,
+                )
+            elif args.mode == "qwen_grounded":
+                success = run_episode_qwen_grounded(
+                    env=env,
+                    task_description=task_description,
+                    world_state=world_state,
+                    perception=perception,
+                    config=config.skill,
+                    logger=logger,
+                    grounder=grounder,
+                    grounding_metrics=grounding_metrics,
                     task_id=task_id_str,
                 )
         except Exception as e:
@@ -379,6 +493,19 @@ def main():
         metrics.print_summary()
         metrics.save(str(output_dir / "planner_metrics.json"))
 
+    # Print grounding metrics for qwen_grounded mode
+    if grounding_metrics:
+        print("\n--- Grounding Metrics ---")
+        gm_summary = grounding_metrics.summary()
+        print(f"Total attempts: {gm_summary['total_attempts']}")
+        print(f"Parse rate: {gm_summary['parse_rate']:.1%}")
+        print(f"Validation rate: {gm_summary['validation_rate']:.1%}")
+        print(f"Ambiguous rate: {gm_summary['ambiguous_rate']:.1%}")
+
+        import json as json_mod
+        with open(output_dir / "grounding_metrics.json", "w") as f:
+            json_mod.dump(gm_summary, f, indent=2)
+
     # Save final summary
     summary = {
         "mode": args.mode,
@@ -396,6 +523,9 @@ def main():
 
     if metrics:
         summary["planner_metrics"] = metrics.summary()
+
+    if grounding_metrics:
+        summary["grounding_metrics"] = grounding_metrics.summary()
 
     with open(output_dir / "summary.json", "w") as f:
         json.dump(summary, f, indent=2)

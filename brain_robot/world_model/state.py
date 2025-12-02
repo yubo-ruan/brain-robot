@@ -86,16 +86,16 @@ class WorldState:
     
     def update_from_perception(self, perception: PerceptionResult):
         """Update world state from perception result.
-        
+
         Reconciles symbolic state with new perception data.
         Handles disappeared objects and updates timestamps.
         """
         current_time = perception.timestamp or time.time()
-        
+
         # Track which objects we see
         perceived_objects = set(perception.object_names)
         known_objects = set(self.objects.keys())
-        
+
         # Handle disappeared objects
         disappeared = known_objects - perceived_objects
         for obj in disappeared:
@@ -107,7 +107,7 @@ class WorldState:
             # Keep object in memory but mark as stale
             if obj in self.objects:
                 self.objects[obj].confidence = 0.5
-        
+
         # Update existing objects and add new ones
         for name in perception.object_names:
             if name in perception.objects:
@@ -124,11 +124,25 @@ class WorldState:
                         pose=pose,
                         last_seen=current_time,
                     )
-        
+
+        # Update spatial relations from perception
+        # Only update for objects we're not holding (held objects have no spatial relation)
+        if perception.on:
+            for obj, surface in perception.on.items():
+                if obj != self.holding:
+                    self.on[obj] = surface
+        if perception.inside:
+            for obj, container in perception.inside.items():
+                if obj != self.holding:
+                    self.inside[obj] = container
+                    # Inside overrides on
+                    if obj in self.on:
+                        del self.on[obj]
+
         # Update gripper state
         self.gripper_pose = perception.gripper_pose
         self.gripper_width = perception.gripper_width
-        
+
         # Update timestamps
         self.last_perception_time = current_time
         self.perception_stale = False

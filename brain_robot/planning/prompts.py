@@ -5,6 +5,7 @@ Prompts are designed to make Qwen output valid JSON skill sequences.
 
 from typing import Dict, List, Any
 from .skill_schema import get_skill_schema_for_prompt
+from ..grounding.enriched_object import parse_object_description, enrich_objects
 
 
 SYSTEM_PROMPT = """You are a robot task planner. Given a task description and the current world state, output a sequence of skills to accomplish the task.
@@ -127,56 +128,4 @@ def prepare_world_state_for_qwen(world_state) -> Dict[str, Any]:
     }
 
 
-def parse_object_description(obj_id: str) -> str:
-    """Parse LIBERO object ID into human-readable description.
-
-    Examples:
-        "akita_black_bowl_1_main" → "black bowl"
-        "plate_1_main" → "plate"
-        "glazed_rim_porcelain_ramekin_1_main" → "porcelain ramekin"
-        "wooden_cabinet_1_base" → "wooden cabinet"
-    """
-    # Remove common suffixes
-    name = obj_id.lower()
-    for suffix in ["_main", "_base", "_top", "_middle", "_bottom"]:
-        name = name.replace(suffix, "")
-
-    # Remove trailing numbers
-    parts = name.split("_")
-    if parts and parts[-1].isdigit():
-        parts = parts[:-1]
-
-    # Known object types
-    OBJECT_TYPES = ["bowl", "plate", "mug", "cup", "drawer", "cabinet", "box", "can", "bottle", "ramekin", "cookies", "stove", "burner"]
-    COLORS = ["black", "white", "red", "blue", "green", "yellow", "brown"]
-    MATERIALS = ["wooden", "metal", "plastic", "glass", "ceramic", "porcelain", "glazed"]
-    IGNORE = ["akita", "rim", "flat"]  # Brand names or non-descriptive
-
-    obj_type = None
-    color = None
-    material = None
-
-    for part in parts:
-        if part in OBJECT_TYPES:
-            obj_type = part
-        elif part in COLORS:
-            color = part
-        elif part in MATERIALS:
-            material = part
-        elif part in IGNORE:
-            continue
-
-    # Build description
-    desc_parts = []
-    if color:
-        desc_parts.append(color)
-    if material:
-        desc_parts.append(material)
-    if obj_type:
-        desc_parts.append(obj_type)
-
-    if desc_parts:
-        return " ".join(desc_parts)
-
-    # Fallback: use cleaned name
-    return " ".join(p for p in parts if p not in IGNORE)
+# parse_object_description is now imported from grounding module

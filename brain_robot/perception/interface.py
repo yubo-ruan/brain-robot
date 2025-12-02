@@ -13,25 +13,29 @@ import numpy as np
 @dataclass
 class PerceptionResult:
     """Result from perception system.
-    
+
     All poses are in world frame (robosuite default).
     Pose format: [x, y, z, qw, qx, qy, qz] - position + quaternion.
     """
-    
+
     # Object poses: {object_name: 7D pose}
     objects: Dict[str, np.ndarray] = field(default_factory=dict)
-    
+
     # Object names (for convenience)
     object_names: List[str] = field(default_factory=list)
-    
+
+    # Spatial relations (computed from poses)
+    on: Dict[str, str] = field(default_factory=dict)  # obj → surface it's on
+    inside: Dict[str, str] = field(default_factory=dict)  # obj → container it's in
+
     # Gripper state
     gripper_pose: Optional[np.ndarray] = None  # 7D pose
     gripper_width: float = 0.0  # Current gripper opening
-    
+
     # Robot proprioception
     joint_positions: Optional[np.ndarray] = None
     joint_velocities: Optional[np.ndarray] = None
-    
+
     # Metadata
     timestamp: float = 0.0
     frame: str = "world"  # Coordinate frame
