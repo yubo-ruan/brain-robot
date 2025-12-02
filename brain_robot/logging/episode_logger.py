@@ -19,8 +19,8 @@ from ..utils.timing import Timer
 
 
 class NumpyEncoder(json.JSONEncoder):
-    """JSON encoder that handles numpy arrays."""
-    
+    """JSON encoder that handles numpy arrays and types."""
+
     def default(self, obj):
         if isinstance(obj, np.ndarray):
             return obj.tolist()
@@ -28,6 +28,8 @@ class NumpyEncoder(json.JSONEncoder):
             return int(obj)
         if isinstance(obj, np.floating):
             return float(obj)
+        if isinstance(obj, (np.bool_, bool)):
+            return bool(obj)
         return super().default(obj)
 
 
@@ -158,7 +160,7 @@ class EpisodeLogger:
         result: SkillResult,
     ):
         """Log a skill execution.
-        
+
         Args:
             skill_name: Name of the skill.
             args: Skill arguments.
@@ -166,15 +168,10 @@ class EpisodeLogger:
         """
         if self.current_episode is None:
             return
-        
-        # Convert numpy arrays in result.info
-        info = {}
-        for k, v in result.info.items():
-            if isinstance(v, np.ndarray):
-                info[k] = v.tolist()
-            else:
-                info[k] = v
-        
+
+        # Recursively convert numpy types in result.info
+        info = self._convert_numpy_types(result.info)
+
         self.current_episode.skill_sequence.append({
             "skill": skill_name,
             "args": args,
@@ -182,6 +179,23 @@ class EpisodeLogger:
             "info": info,
             "timestamp": time.time() - self._episode_start_time,
         })
+
+    def _convert_numpy_types(self, obj: Any) -> Any:
+        """Recursively convert numpy types to native Python types."""
+        if isinstance(obj, dict):
+            return {k: self._convert_numpy_types(v) for k, v in obj.items()}
+        elif isinstance(obj, (list, tuple)):
+            return [self._convert_numpy_types(v) for v in obj]
+        elif isinstance(obj, np.ndarray):
+            return obj.tolist()
+        elif isinstance(obj, np.integer):
+            return int(obj)
+        elif isinstance(obj, np.floating):
+            return float(obj)
+        elif isinstance(obj, (np.bool_, bool)):
+            return bool(obj)
+        else:
+            return obj
     
     def log_world_state(self, world_state: WorldState):
         """Log world state snapshot.

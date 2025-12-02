@@ -22,6 +22,12 @@ class SkillConfig:
     grasp_lift_height: float = 0.05  # 5cm lift after grasp
     grasp_close_threshold: float = 0.01  # Gripper width indicating closed
 
+    # Grasp XY refinement (corrects ApproachSkill residual error)
+    grasp_xy_refine_enabled: bool = True  # Enable XY refinement before grasp
+    grasp_xy_refine_max_steps: int = 30  # Max steps for refinement
+    grasp_xy_refine_threshold: float = 0.03  # 3cm success threshold
+    grasp_xy_refine_min_improvement: float = 0.005  # Stop if improvement < 5mm
+
     # Move skill
     move_max_steps: int = 400  # Increased for longer translations
     move_pos_threshold: float = 0.05  # 5cm (slightly more relaxed)
