@@ -53,6 +53,9 @@ def create_visualization_frame(
     Returns:
         Annotated image as numpy array
     """
+    # Flip image vertically (LIBERO camera has flipped Y-axis)
+    image = np.flipud(image).copy()
+
     # Resize image if needed
     if image.shape[0] != 256:
         pil_img = Image.fromarray(image)
