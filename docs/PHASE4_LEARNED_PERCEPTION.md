@@ -61,6 +61,20 @@ random.shuffle(episodes)
 train_episodes = episodes[:split]
 ```
 
+### 4. Train/Val Split Policy (Phase 4)
+
+**Policy**: Within-task generalization with episode-level splits.
+
+- **What we're testing**: Can learned perception generalize to new episodes of the same 6 LIBERO spatial tasks?
+- **Split method**: Mix episodes from all tasks, split 90/10 by episode (not frame)
+- **What this measures**: Robustness to viewpoint/configuration variation within known task types
+
+**What this does NOT measure**:
+- Cross-task generalization (novel tasks, unseen objects)
+- Sim-to-real transfer
+
+**Future work**: For cross-task generalization, use task-held-out splits (e.g., train on tasks 0-4, test on task 5).
+
 ---
 
 ## Architecture Overview
