@@ -13,6 +13,17 @@ from ..world_model.state import WorldState
 from ..control.cartesian_pd import CartesianPDController
 from ..config import SkillConfig
 
+# Import robosuite camera utilities for depth conversion
+try:
+    from robosuite.utils.camera_utils import (
+        get_camera_intrinsic_matrix,
+        get_camera_extrinsic_matrix,
+        get_real_depth_map,
+    )
+    HAS_ROBOSUITE_CAMERA = True
+except ImportError:
+    HAS_ROBOSUITE_CAMERA = False
+
 
 class GraspSkill(Skill):
     """Grasp object after approach.
@@ -94,10 +105,12 @@ class GraspSkill(Skill):
         else:
             self.lift_height = lift_height
             # Default XY refinement settings
+            # Increased max_steps from 30 to 50 for better convergence on
+            # constrained locations (drawer, cabinet) with large initial XY errors
             self.xy_refine_enabled = True
-            self.xy_refine_max_steps = 30
+            self.xy_refine_max_steps = 50
             self.xy_refine_threshold = 0.03
-            self.xy_refine_min_improvement = 0.005
+            self.xy_refine_min_improvement = 0.003  # Reduced from 0.005 for finer corrections
 
         self.grasp_height_offset = grasp_height_offset
         self.controller = CartesianPDController.from_config(self.config)
@@ -205,11 +218,18 @@ class GraspSkill(Skill):
             current_pose = self._get_gripper_pose(env, obs)
             last_obs = obs
 
+        # Extract depth data for learned grasp selectors (CGN)
+        # This converts raw MuJoCo depth to meters and gets camera parameters
+        depth_image, camera_intrinsics, camera_extrinsics = self._extract_depth_data(env, last_obs)
+
         # Compute full 6-DoF grasp pose BEFORE XY refinement
         # For learned selectors (CGN), this gives us position + orientation + width
         # For heuristic, gives position with default orientation
         grasp_xyz, grasp_orientation, grasp_width, grasp_point_info = self._compute_grasp_pose(
-            obj_pose, obj_name, world_state, current_pose
+            obj_pose, obj_name, world_state, current_pose,
+            depth_image=depth_image,
+            camera_intrinsics=camera_intrinsics,
+            camera_extrinsics=camera_extrinsics,
         )
 
         # Determine if we're using a learned grasp (affects servo behavior)
@@ -248,9 +268,15 @@ class GraspSkill(Skill):
         grasp_target[1] = grasp_xyz[1]
         grasp_target[2] = grasp_xyz[2]
 
-        # For learned grasps, use predicted orientation
-        # For heuristic grasps, keep current orientation (gripper-down)
-        if using_learned_grasp and grasp_orientation is not None:
+        # For learned grasps, we have two options:
+        # 1. Use predicted 6-DoF orientation (may not work with all robot kinematics)
+        # 2. Use position only with gripper-down orientation (more robust)
+        #
+        # Currently using option 2 (position-only) for better compatibility.
+        # CGN's orientations are often for table-top grasps that may conflict with
+        # the robot's OSC controller. If full 6-DoF is needed, set use_cgn_orientation=True
+        use_cgn_orientation = False  # Set to True to use CGN's full 6-DoF pose
+        if using_learned_grasp and grasp_orientation is not None and use_cgn_orientation:
             grasp_target[3:7] = grasp_orientation
 
         # Compute grasp offset from object center ONCE for visual servo
@@ -280,7 +306,8 @@ class GraspSkill(Skill):
 
             # VISUAL SERVO: Check gripper-to-object error periodically
             # Update target if object moved or gripper drifted significantly
-            servo_interval = 5
+            # Increased frequency (was 5) for faster tracking of object drift
+            servo_interval = 2
             if step > 0 and step % servo_interval == 0:
                 live_obj_pos = self._get_live_object_position(env, obj_name)
 
@@ -449,7 +476,20 @@ class GraspSkill(Skill):
 
         # Check if grasp succeeded
         final_pose = self._get_gripper_pose(env, last_obs)
-        gripper_closed = self._check_gripper_closed(last_obs)
+
+        # Extract object type for class-specific gripper check
+        obj_type = None
+        if obj_name in world_state.objects:
+            obj_type = world_state.objects[obj_name].object_type
+        if obj_type is None:
+            # Fallback: infer type from name
+            obj_name_lower = obj_name.lower()
+            for known_type in self.GRIPPER_WIDTH_THRESHOLDS.keys():
+                if known_type in obj_name_lower:
+                    obj_type = known_type
+                    break
+
+        gripper_closed = self._check_gripper_closed(last_obs, obj_type)
 
         # Get gripper width for debugging
         if last_obs and 'robot0_gripper_qpos' in last_obs:
@@ -593,35 +633,60 @@ class GraspSkill(Skill):
             "last_obs": last_obs,
         }
 
-    def _check_gripper_closed(self, obs: dict) -> bool:
+    # Class-specific gripper width thresholds for grasp verification
+    # Based on empirical observation of successful/failed grasps
+    # Format: (min_width, max_width) in meters
+    # min_width: Too small = closed on nothing (air grasp)
+    # max_width: Too large = gripper didn't close properly (missed object)
+    GRIPPER_WIDTH_THRESHOLDS = {
+        # Hollow objects with rim grasps - relatively wide range
+        'bowl': (0.003, 0.070),      # Bowl rim grasps vary widely by bowl size
+        'mug': (0.005, 0.065),       # Mug handle/rim
+        'cup': (0.005, 0.065),       # Cup rim
+        'ramekin': (0.003, 0.055),   # Small ramekin
+        # Solid objects - wider grip typically
+        'plate': (0.008, 0.070),     # Flat, edge grasp
+        'bottle': (0.010, 0.065),    # Cylindrical
+        'can': (0.010, 0.065),       # Cylindrical
+        'cookie_box': (0.015, 0.070),  # Box shape
+        # Default for unknown objects - generous range
+        'default': (0.003, 0.075),
+    }
+
+    def _check_gripper_closed(self, obs: dict, obj_type: str = None) -> bool:
         """Check if gripper successfully grasped something.
 
-        Heuristic: gripper width should be non-zero but less than fully open.
-        For small objects (~4cm), we need tighter thresholds to distinguish
-        between grasping an object vs closing on air.
+        Uses class-specific thresholds for more accurate grasp verification.
+        Different objects have different expected gripper widths when grasped.
 
         Robosuite gripper qpos values:
         - Fully open (action=-1): width ~0.08
-        - Fully closed on nothing (action=+1): width ~0.001
-        - Closed on small object (~4cm): width ~0.02-0.04
+        - Fully closed on nothing (action=+1): width ~0.001-0.002
+        - Closed on small object (~4cm): width ~0.015-0.040
+
+        Args:
+            obs: Observation dictionary with gripper state
+            obj_type: Optional object type for class-specific thresholds
         """
         if obs is None:
-            return True  # Assume success if can't check
+            return False  # Can't verify - be conservative
 
-        if 'robot0_gripper_qpos' in obs:
-            gripper_qpos = obs['robot0_gripper_qpos']
-            # Non-zero gripper width indicates something is grasped
-            width = np.sum(np.abs(gripper_qpos))
-            # Threshold range for successful grasp:
-            # - Fully closed on nothing: ~0.001 (too small - no object)
-            # - Closed on small object (~4cm): ~0.01-0.04 (good)
-            # - Fully open: ~0.08 (too large - not closed)
-            # Lower threshold to 0.003 - bowl rim grasps can be very tight
-            # Values of 0.0038-0.0050 indicate partial rim grasp
-            return 0.003 < width < 0.07
+        if 'robot0_gripper_qpos' not in obs:
+            return False  # Can't verify without gripper data
 
-        # Can't verify without gripper data - return False to be conservative
-        return False
+        gripper_qpos = obs['robot0_gripper_qpos']
+        width = np.sum(np.abs(gripper_qpos))
+
+        # Get class-specific thresholds
+        if obj_type and obj_type.lower() in self.GRIPPER_WIDTH_THRESHOLDS:
+            min_width, max_width = self.GRIPPER_WIDTH_THRESHOLDS[obj_type.lower()]
+        else:
+            min_width, max_width = self.GRIPPER_WIDTH_THRESHOLDS['default']
+
+        # Check if width is in valid range for a successful grasp
+        # Too small = closed on nothing (air)
+        # Too large = gripper didn't close properly
+        return min_width < width < max_width
 
     def _verify_object_lifted(self, env, obj_name: str, initial_z: float) -> bool:
         """Verify the object was actually lifted by checking its Z position.
@@ -699,6 +764,63 @@ class GraspSkill(Skill):
         except Exception:
             return None
 
+    def _extract_depth_data(
+        self,
+        env,
+        obs: Optional[dict],
+        camera_name: str = "agentview",
+    ) -> Tuple[Optional[np.ndarray], Optional[np.ndarray], Optional[np.ndarray]]:
+        """Extract depth image and camera parameters from LIBERO environment.
+
+        Converts raw MuJoCo depth [0,1] to meters using robosuite's utilities.
+
+        Args:
+            env: LIBERO environment with sim
+            obs: Observation dictionary containing 'agentview_depth'
+            camera_name: Camera name for intrinsics lookup
+
+        Returns:
+            Tuple of (depth_meters, camera_intrinsics, camera_extrinsics):
+            - depth_meters: (H, W) depth image in meters, or None
+            - camera_intrinsics: (3, 3) camera K matrix, or None
+            - camera_extrinsics: (4, 4) camera pose in world frame, or None
+        """
+        if not HAS_ROBOSUITE_CAMERA:
+            return None, None, None
+
+        if obs is None:
+            return None, None, None
+
+        # Get raw depth from observation
+        depth_key = f"{camera_name}_depth"
+        depth_raw = obs.get(depth_key)
+        if depth_raw is None:
+            return None, None, None
+
+        try:
+            # Convert raw depth [0,1] to meters using robosuite's formula
+            # This handles MuJoCo's OpenGL depth buffer correctly
+            depth_meters = get_real_depth_map(env.sim, depth_raw)
+
+            # Handle shape: (H, W, 1) -> (H, W)
+            if depth_meters.ndim == 3:
+                depth_meters = depth_meters[:, :, 0]
+
+            # Get camera intrinsics and extrinsics
+            height, width = depth_meters.shape
+            camera_intrinsics = get_camera_intrinsic_matrix(
+                env.sim, camera_name, height, width
+            )
+            camera_extrinsics = get_camera_extrinsic_matrix(
+                env.sim, camera_name
+            )
+
+            return depth_meters, camera_intrinsics, camera_extrinsics
+
+        except Exception as e:
+            print(f"[GraspSkill] Failed to extract depth data: {e}")
+            return None, None, None
+
     def _compute_grasp_pose(
         self,
         obj_pose: np.ndarray,
@@ -708,6 +830,7 @@ class GraspSkill(Skill):
         point_cloud: Optional[np.ndarray] = None,
         depth_image: Optional[np.ndarray] = None,
         camera_intrinsics: Optional[np.ndarray] = None,
+        camera_extrinsics: Optional[np.ndarray] = None,
     ) -> Tuple[np.ndarray, np.ndarray, float, Dict[str, Any]]:
         """Compute optimal 6-DoF grasp pose using the configured GraspSelector.
 
@@ -720,8 +843,9 @@ class GraspSkill(Skill):
             world_state: World state with object metadata
             gripper_pose: Current gripper pose (used to determine offset direction)
             point_cloud: Optional point cloud (N, 3) for learned selectors
-            depth_image: Optional depth image for point cloud generation
+            depth_image: Optional depth image in meters for point cloud generation
             camera_intrinsics: Optional camera K matrix (3x3)
+            camera_extrinsics: Optional camera pose in world frame (4x4)
 
         Returns:
             Tuple of (position, orientation, gripper_width, info_dict):
@@ -756,6 +880,7 @@ class GraspSkill(Skill):
             point_cloud=point_cloud,
             depth_image=depth_image,
             camera_intrinsics=camera_intrinsics,
+            camera_extrinsics=camera_extrinsics,
         )
 
         # Extract position

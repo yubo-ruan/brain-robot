@@ -51,6 +51,7 @@ def make_libero_env(task_suite: str, task_id: int):
         "bddl_file_name": task_bddl_file,
         "camera_heights": 128,
         "camera_widths": 128,
+        "camera_depths": True,  # Required for CGN grasp selector
     }
 
     env = OffScreenRenderEnv(**env_args)
@@ -58,6 +59,60 @@ def make_libero_env(task_suite: str, task_id: int):
     env.task_name = task.name
 
     return env, task.language
+
+
+def check_libero_success(env) -> bool:
+    """Check LIBERO's built-in success condition.
+
+    This is the ground truth for whether the task goal was actually achieved,
+    independent of whether our skills thought they succeeded.
+    """
+    if hasattr(env, 'env') and hasattr(env.env, '_check_success'):
+        return bool(env.env._check_success())
+    return False
+
+
+def classify_task_type(task_description: str) -> str:
+    """Classify task into supported types.
+
+    Returns one of:
+        - "pick_and_place": Pick X and place on/in Y
+        - "open": Open drawer/cabinet
+        - "close": Close drawer/cabinet
+        - "turn_on": Turn on stove/appliance
+        - "turn_off": Turn off stove/appliance
+        - "push": Push object to location
+        - "unsupported": Task type not recognized
+    """
+    task_lower = task_description.lower()
+
+    # Check for open/close tasks
+    if 'open' in task_lower and ('drawer' in task_lower or 'cabinet' in task_lower or 'door' in task_lower):
+        return "open"
+    if 'close' in task_lower and ('drawer' in task_lower or 'cabinet' in task_lower or 'door' in task_lower):
+        return "close"
+
+    # Check for turn on/off tasks
+    if 'turn on' in task_lower or 'switch on' in task_lower:
+        return "turn_on"
+    if 'turn off' in task_lower or 'switch off' in task_lower:
+        return "turn_off"
+
+    # Check for push tasks
+    if 'push' in task_lower:
+        return "push"
+
+    # Check for pick and place (most common)
+    pick_keywords = ['pick up', 'pick the', 'grab', 'take', 'put the', 'place the', 'move the']
+    place_keywords = ['place it', 'put it', 'on the', 'in the', 'into the', 'onto the']
+
+    has_pick = any(kw in task_lower for kw in pick_keywords)
+    has_place = any(kw in task_lower for kw in place_keywords)
+
+    if has_pick or has_place:
+        return "pick_and_place"
+
+    return "unsupported"
 
 
 def extract_expected_classes(task_description: str) -> tuple:
@@ -253,7 +308,8 @@ def parse_task_for_grounding(task_description: str, object_names: list) -> tuple
 @dataclass
 class EpisodeResult:
     """Result of a single episode with both physical and semantic success."""
-    physical_success: bool
+    physical_success: bool  # Our skills reported success
+    libero_success: bool  # LIBERO's ground truth success (task goal achieved)
     semantic_source_correct: bool
     semantic_target_correct: bool
     chosen_source_id: str = ""
@@ -262,11 +318,88 @@ class EpisodeResult:
     chosen_target_class: str = ""
     expected_source_class: str = ""
     expected_target_class: str = ""
+    # Failure taxonomy fields
+    failed_skill: str = ""  # Which skill failed
+    failure_reason: str = ""  # Why it failed
+    # Task type classification
+    task_type: str = "pick_and_place"  # From classify_task_type()
 
     @property
     def semantic_success(self) -> bool:
         """Both source and target must be semantically correct."""
         return self.semantic_source_correct and self.semantic_target_correct
+
+
+def extract_failure_reason(result_info: dict) -> str:
+    """Extract failure reason from skill result info."""
+    if result_info.get("timeout"):
+        return "timeout"
+    if result_info.get("stuck"):
+        return "stuck"
+    if "precondition" in result_info.get("error_msg", "").lower():
+        return "precondition"
+    if "closed on air" in result_info.get("error_msg", "").lower():
+        return "closed_on_air"
+    if "not holding" in result_info.get("error_msg", "").lower():
+        return "not_holding"
+    if "not found" in result_info.get("error_msg", "").lower():
+        return "object_not_found"
+    if result_info.get("error_msg"):
+        return result_info["error_msg"][:50]
+    return "unknown"
+
+
+def print_failure_taxonomy(semantic_results: list):
+    """Print failure taxonomy summary."""
+    if not semantic_results:
+        return
+
+    skill_failures = {}
+    reason_counts = {}
+    task_type_counts = {}
+    unsupported_tasks = 0
+
+    for r in semantic_results:
+        # Count task types
+        task_type = r.get("task_type", "pick_and_place")
+        task_type_counts[task_type] = task_type_counts.get(task_type, 0) + 1
+
+        if not r["physical_success"]:
+            reason = r.get("failure_reason", "unknown")
+            reason_counts[reason] = reason_counts.get(reason, 0) + 1
+
+            # Count unsupported task types
+            if reason.startswith("unsupported_task_type:"):
+                unsupported_tasks += 1
+            elif r.get("failed_skill"):
+                skill = r["failed_skill"]
+                skill_failures[skill] = skill_failures.get(skill, 0) + 1
+
+    print("\n" + "-" * 60)
+    print("FAILURE TAXONOMY")
+    print("-" * 60)
+
+    # Task type breakdown
+    print(f"\nBy Task Type:")
+    for task_type, count in sorted(task_type_counts.items(), key=lambda x: -x[1]):
+        print(f"  {task_type}: {count}")
+
+    if unsupported_tasks > 0:
+        print(f"\n⚠ Unsupported task types: {unsupported_tasks} episodes skipped")
+
+    if skill_failures:
+        total_skill_failures = sum(skill_failures.values())
+        print(f"\nBy Skill ({total_skill_failures} skill failures):")
+        for skill in ["ApproachObject", "GraspObject", "MoveObjectToRegion", "PlaceObject"]:
+            if skill in skill_failures:
+                count = skill_failures[skill]
+                print(f"  {skill}: {count} ({100*count/total_skill_failures:.0f}%)")
+
+    if reason_counts:
+        total_failures = sum(reason_counts.values())
+        print(f"\nBy Reason ({total_failures} total failures):")
+        for reason, count in sorted(reason_counts.items(), key=lambda x: -x[1]):
+            print(f"  {reason}: {count} ({100*count/total_failures:.0f}%)")
 
 
 def run_episode_hardcoded(
@@ -276,8 +409,25 @@ def run_episode_hardcoded(
     perception: OraclePerception,
     config: SkillConfig,
     logger: EpisodeLogger,
+    grasp_selector_type: str = "heuristic",
 ) -> EpisodeResult:
     """Run episode with hardcoded skill sequence (Phase 1 baseline)."""
+    # Classify task type first
+    task_type = classify_task_type(task_description)
+    print(f"  Task type: {task_type}")
+
+    # Handle unsupported task types gracefully
+    if task_type not in ["pick_and_place"]:
+        print(f"  ⚠ Task type '{task_type}' not supported by current skill pipeline")
+        return EpisodeResult(
+            physical_success=False,
+            libero_success=False,
+            semantic_source_correct=False,
+            semantic_target_correct=False,
+            failure_reason=f"unsupported_task_type:{task_type}",
+            task_type=task_type,
+        )
+
     perc_result = perception.perceive(env)
     world_state.update_from_perception(perc_result)
     logger.log_world_state(world_state)
@@ -288,10 +438,13 @@ def run_episode_hardcoded(
     if len(perc_result.object_names) < 2:
         return EpisodeResult(
             physical_success=False,
+            libero_success=check_libero_success(env),
             semantic_source_correct=False,
             semantic_target_correct=False,
             expected_source_class=expected_source_class or "",
             expected_target_class=expected_target_class or "",
+            failure_reason="insufficient_objects",
+            task_type=task_type,
         )
 
     source_obj, target_obj = parse_task_for_grounding(task_description, perc_result.object_names)
@@ -301,6 +454,7 @@ def run_episode_hardcoded(
         print(f"  ✗ Grounding failed: source={source_obj}, target={target_obj}")
         return EpisodeResult(
             physical_success=False,
+            libero_success=check_libero_success(env),
             semantic_source_correct=False,
             semantic_target_correct=False,
             chosen_source_id=source_obj or "",
@@ -309,6 +463,8 @@ def run_episode_hardcoded(
             chosen_target_class="none",
             expected_source_class=expected_source_class or "",
             expected_target_class=expected_target_class or "",
+            failure_reason="grounding_failed",
+            task_type=task_type,
         )
 
     # Check semantic correctness
@@ -319,10 +475,11 @@ def run_episode_hardcoded(
 
     print(f"  Source: {source_obj} (class={chosen_source_class}, expected={expected_source_class})")
     print(f"  Target: {target_obj} (class={chosen_target_class}, expected={expected_target_class})")
+    print(f"  Grasp selector: {grasp_selector_type}")
 
     skills = [
         (ApproachSkill(config=config), {"obj": source_obj}),
-        (GraspSkill(config=config), {"obj": source_obj}),
+        (GraspSkill(config=config, grasp_selector_type=grasp_selector_type), {"obj": source_obj}),
         (MoveSkill(config=config), {"obj": source_obj, "region": target_obj}),
         (PlaceSkill(config=config), {"obj": source_obj, "region": target_obj}),
     ]
@@ -344,9 +501,11 @@ def run_episode_hardcoded(
         step_count += result.info.get("steps_taken", 0)
 
         if not result.success:
+            failure_reason = extract_failure_reason(result.info)
             print(f"  {skill.name} failed: {result.info.get('error_msg', 'Unknown')}")
             return EpisodeResult(
                 physical_success=False,
+                libero_success=check_libero_success(env),
                 semantic_source_correct=semantic_source_correct,
                 semantic_target_correct=semantic_target_correct,
                 chosen_source_id=source_obj or "",
@@ -355,13 +514,22 @@ def run_episode_hardcoded(
                 chosen_target_class=chosen_target_class,
                 expected_source_class=expected_source_class or "",
                 expected_target_class=expected_target_class or "",
+                failed_skill=skill.name,
+                failure_reason=failure_reason,
+                task_type=task_type,
             )
 
         print(f"  {skill.name}: OK ({result.info.get('steps_taken', 0)} steps)")
 
     print(f"  Total steps: {step_count}")
+
+    # Check LIBERO's ground truth success
+    libero_success = check_libero_success(env)
+    print(f"  LIBERO success: {libero_success}")
+
     return EpisodeResult(
         physical_success=True,
+        libero_success=libero_success,
         semantic_source_correct=semantic_source_correct,
         semantic_target_correct=semantic_target_correct,
         chosen_source_id=source_obj or "",
@@ -370,6 +538,7 @@ def run_episode_hardcoded(
         chosen_target_class=chosen_target_class,
         expected_source_class=expected_source_class or "",
         expected_target_class=expected_target_class or "",
+        task_type=task_type,
     )
 
 
@@ -542,6 +711,8 @@ def main():
     parser.add_argument("--n-episodes", type=int, default=20)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--output-dir", type=str, default="logs/evaluation")
+    parser.add_argument("--grasp-selector", type=str, choices=["heuristic", "contact_graspnet"], default="heuristic",
+                        help="Grasp selector: heuristic (rule-based) or contact_graspnet (learned 6-DoF)")
     args = parser.parse_args()
 
     # Validate model path for learned perception
@@ -565,7 +736,8 @@ def main():
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     perception_suffix = f"_{args.perception}" if args.perception != "oracle" else ""
     bootstrap_suffix = f"_{args.bootstrap}" if args.perception == "learned" and args.bootstrap != "oracle" else ""
-    output_dir = Path(args.output_dir) / f"{args.mode}{perception_suffix}{bootstrap_suffix}_{timestamp}"
+    grasp_suffix = f"_{args.grasp_selector}" if args.grasp_selector != "heuristic" else ""
+    output_dir = Path(args.output_dir) / f"{args.mode}{perception_suffix}{bootstrap_suffix}{grasp_suffix}_{timestamp}"
     output_dir.mkdir(parents=True, exist_ok=True)
 
     # Save config
@@ -575,6 +747,7 @@ def main():
             "perception": args.perception,
             "bootstrap": args.bootstrap if args.perception == "learned" else None,
             "model_path": args.model_path if args.perception == "learned" else None,
+            "grasp_selector": args.grasp_selector,
             **config.to_dict()
         }, f, indent=2)
 
@@ -591,6 +764,7 @@ def main():
     print("=" * 60)
     print(f"Mode: {args.mode}")
     print(f"Perception: {perception_name}")
+    print(f"Grasp Selector: {args.grasp_selector}")
     if args.perception == "learned":
         print(f"Model: {args.model_path}")
         print(f"Bootstrap: {args.bootstrap}")
@@ -680,6 +854,7 @@ def main():
                     perception=perception,
                     config=config.skill,
                     logger=logger,
+                    grasp_selector_type=args.grasp_selector,
                 )
                 success = episode_result.physical_success
             elif args.mode == "qwen":
@@ -728,6 +903,7 @@ def main():
             semantic_results.append({
                 "episode": episode_idx,
                 "physical_success": episode_result.physical_success,
+                "libero_success": episode_result.libero_success,
                 "semantic_source_correct": episode_result.semantic_source_correct,
                 "semantic_target_correct": episode_result.semantic_target_correct,
                 "semantic_success": episode_result.semantic_success,
@@ -737,6 +913,9 @@ def main():
                 "chosen_target_class": episode_result.chosen_target_class,
                 "expected_source_class": episode_result.expected_source_class,
                 "expected_target_class": episode_result.expected_target_class,
+                "failed_skill": episode_result.failed_skill,
+                "failure_reason": episode_result.failure_reason,
+                "task_type": episode_result.task_type,
             })
 
             if not episode_result.semantic_source_correct:
@@ -765,6 +944,7 @@ def main():
     if semantic_results:
         n_semantic = len(semantic_results)
         n_physical_success = sum(1 for r in semantic_results if r["physical_success"])
+        n_libero_success = sum(1 for r in semantic_results if r.get("libero_success", False))
         n_semantic_source = sum(1 for r in semantic_results if r["semantic_source_correct"])
         n_semantic_target = sum(1 for r in semantic_results if r["semantic_target_correct"])
         n_semantic_both = sum(1 for r in semantic_results if r["semantic_success"])
@@ -775,11 +955,21 @@ def main():
         # Count grounding failures (no object found)
         n_grounding_fail = sum(1 for r in semantic_results
                                if r.get("chosen_source_class") == "none" or r.get("chosen_target_class") == "none")
+        # Count "fake" successes (skills said OK but LIBERO says not achieved)
+        n_fake = sum(1 for r in semantic_results
+                     if r["physical_success"] and not r.get("libero_success", False))
+
+        print("\n" + "-" * 60)
+        print("SUCCESS METRICS")
+        print("-" * 60)
+        print(f"Skill Success Rate:        {100*n_physical_success/n_semantic:.1f}% ({n_physical_success}/{n_semantic}) [skills reported OK]")
+        print(f"LIBERO Success Rate:       {100*n_libero_success/n_semantic:.1f}% ({n_libero_success}/{n_semantic}) [actual task goal achieved]")
+        if n_fake > 0:
+            print(f"Fake Success Rate:         {100*n_fake/n_semantic:.1f}% ({n_fake}/{n_semantic}) [skills OK but goal NOT achieved]")
 
         print("\n" + "-" * 60)
         print("SEMANTIC CORRECTNESS")
         print("-" * 60)
-        print(f"Physical Success Rate:     {100*n_physical_success/n_semantic:.1f}% ({n_physical_success}/{n_semantic})")
         print(f"Semantic Source Correct:   {100*n_semantic_source/n_semantic:.1f}% ({n_semantic_source}/{n_semantic})")
         print(f"Semantic Target Correct:   {100*n_semantic_target/n_semantic:.1f}% ({n_semantic_target}/{n_semantic})")
         print(f"Semantic Both Correct:     {100*n_semantic_both/n_semantic:.1f}% ({n_semantic_both}/{n_semantic})")
@@ -787,10 +977,16 @@ def main():
         if n_grounding_fail > 0:
             print(f"Grounding Failures:        {100*n_grounding_fail/n_semantic:.1f}% ({n_grounding_fail}/{n_semantic}) [no matching object]")
 
-        # Check for dangerous case: high physical success but low semantic success
+        # Print failure taxonomy
+        print_failure_taxonomy(semantic_results)
+
+        # Check for dangerous cases
         if n_lucky > 0:
             print(f"\n⚠ WARNING: {n_lucky} episodes succeeded physically but with WRONG objects!")
             print("   This means the robot did the manipulation correctly but on the wrong object.")
+        if n_fake > 0:
+            print(f"\n⚠ WARNING: {n_fake} episodes had skill success but LIBERO goal NOT achieved!")
+            print("   This means our skills thought they succeeded but the task was NOT completed.")
 
     # Print planner metrics for Qwen mode
     if metrics:

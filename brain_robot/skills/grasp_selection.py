@@ -365,16 +365,16 @@ class GIGAGraspSelector(GraspSelector):
             self._load_model(model_path)
 
     def _load_model(self, model_path: str):
-        """Load GIGA model from checkpoint."""
-        try:
-            import torch
-            # GIGA model loading would go here
-            # self.model = GIGANet.load(model_path)
-            # self.model.to(self.device)
-            # self.model.eval()
-            print(f"[GIGAGraspSelector] Model loading not implemented: {model_path}")
-        except ImportError:
-            print("[GIGAGraspSelector] PyTorch not available for model loading")
+        """Load GIGA model from checkpoint.
+
+        Note: GIGA model loading is not yet implemented.
+        This selector will fall back to heuristic grasp selection.
+        """
+        # GIGA model loading would go here when implemented:
+        # self.model = GIGANet.load(model_path)
+        # self.model.to(self.device)
+        # self.model.eval()
+        print(f"[GIGAGraspSelector] Model loading not implemented: {model_path}")
 
     def select_grasp(
         self,
@@ -496,6 +496,62 @@ class GIGAGraspSelector(GraspSelector):
         return grasp, info
 
 
+# Global cache for Contact-GraspNet model to avoid reloading every episode
+_CGN_MODEL_CACHE = {
+    "grasp_estimator": None,
+    "loaded": False,
+    "error": None,
+}
+
+
+def _get_cached_cgn_model(checkpoint_dir: Optional[str] = None):
+    """Get or load the Contact-GraspNet model from cache.
+
+    This avoids reloading the ~200MB model every episode, saving ~2-3 seconds per grasp.
+    """
+    global _CGN_MODEL_CACHE
+
+    if _CGN_MODEL_CACHE["loaded"]:
+        return _CGN_MODEL_CACHE["grasp_estimator"], None
+
+    if _CGN_MODEL_CACHE["error"] is not None:
+        return None, _CGN_MODEL_CACHE["error"]
+
+    try:
+        import sys
+        cgn_path = "/tmp/contact_graspnet_pytorch"
+        if cgn_path not in sys.path:
+            sys.path.insert(0, cgn_path)
+
+        from contact_graspnet_pytorch import config_utils
+        from contact_graspnet_pytorch.contact_grasp_estimator import GraspEstimator
+
+        if checkpoint_dir is None:
+            checkpoint_dir = "/tmp/contact_graspnet_pytorch/checkpoints/contact_graspnet"
+
+        config = config_utils.load_config(checkpoint_dir, batch_size=1)
+        grasp_estimator = GraspEstimator(config)
+
+        _CGN_MODEL_CACHE["grasp_estimator"] = grasp_estimator
+        _CGN_MODEL_CACHE["loaded"] = True
+        print(f"[ContactGraspNetSelector] Model loaded successfully on {grasp_estimator.device}")
+
+        return grasp_estimator, None
+
+    except ImportError as e:
+        error = f"contact_graspnet_pytorch not installed: {e}"
+        _CGN_MODEL_CACHE["error"] = error
+        print(f"[ContactGraspNetSelector] {error}")
+        print("  Install from: https://github.com/elchun/contact_graspnet_pytorch")
+        return None, error
+
+    except Exception as e:
+        error = f"Failed to load model: {e}"
+        _CGN_MODEL_CACHE["error"] = error
+        print(f"[ContactGraspNetSelector] {error}")
+        return None, error
+
+
 class ContactGraspNetSelector(GraspSelector):
     """Contact-GraspNet 6-DoF grasp selector.
 
@@ -511,6 +567,8 @@ class ContactGraspNetSelector(GraspSelector):
 
     Note: Requires contact_graspnet_pytorch package to be installed.
     Install from: https://github.com/elchun/contact_graspnet_pytorch
+
+    The model is cached globally to avoid reloading every episode (~2-3s savings).
     """
 
     # LIBERO table height is approximately 0.8m
@@ -551,55 +609,9 @@ class ContactGraspNetSelector(GraspSelector):
         self.score_threshold = score_threshold
         self.filter_grasps = filter_grasps
 
-        self.model = None
-        self.grasp_estimator = None
-        self._model_loaded = False
-        self._load_error = None
-
-        # Attempt to load model
-        self._try_load_model()
-
-    def _try_load_model(self):
-        """Attempt to load Contact-GraspNet model."""
-        try:
-            # Try importing the PyTorch implementation
-            from contact_graspnet_pytorch.contact_graspnet import (
-                ContactGraspNet,
-                load_config,
-            )
-            from contact_graspnet_pytorch.inference import GraspEstimator
-
-            # Load config and model
-            if self.checkpoint_dir:
-                config = load_config(self.checkpoint_dir)
-                self.grasp_estimator = GraspEstimator(
-                    config,
-                    checkpoint_dir=self.checkpoint_dir,
-                    device=self.device,
-                )
-            else:
-                # Use default checkpoint path
-                import contact_graspnet_pytorch
-                pkg_dir = contact_graspnet_pytorch.__path__[0]
-                default_ckpt = f"{pkg_dir}/../checkpoints/contact_graspnet"
-                config = load_config(default_ckpt)
-                self.grasp_estimator = GraspEstimator(
-                    config,
-                    checkpoint_dir=default_ckpt,
-                    device=self.device,
-                )
-
-            self._model_loaded = True
-            print("[ContactGraspNetSelector] Model loaded successfully")
-
-        except ImportError as e:
-            self._load_error = f"contact_graspnet_pytorch not installed: {e}"
-            print(f"[ContactGraspNetSelector] {self._load_error}")
-            print("  Install from: https://github.com/elchun/contact_graspnet_pytorch")
-
-        except Exception as e:
-            self._load_error = f"Failed to load model: {e}"
-            print(f"[ContactGraspNetSelector] {self._load_error}")
+        # Use global cache instead of loading fresh each time
+        self.grasp_estimator, self._load_error = _get_cached_cgn_model(checkpoint_dir)
+        self._model_loaded = self.grasp_estimator is not None
 
     def select_grasp(
         self,
@@ -611,6 +623,7 @@ class ContactGraspNetSelector(GraspSelector):
         rgb_image: Optional[np.ndarray] = None,
         depth_image: Optional[np.ndarray] = None,
         camera_intrinsics: Optional[np.ndarray] = None,
+        camera_extrinsics: Optional[np.ndarray] = None,
         segmentation_mask: Optional[np.ndarray] = None,
         approach_strategy: str = "top_down",
         **kwargs,
@@ -624,8 +637,9 @@ class ContactGraspNetSelector(GraspSelector):
             gripper_pose: Current gripper pose
             point_cloud: Object point cloud (N, 3) in world frame
             rgb_image: RGB image (optional, for visualization)
-            depth_image: Depth image (used if point_cloud not provided)
+            depth_image: Depth image in meters (used if point_cloud not provided)
             camera_intrinsics: Camera K matrix (3x3)
+            camera_extrinsics: Camera pose in world frame (4x4)
             segmentation_mask: Object segmentation mask (optional)
             approach_strategy: Approach direction hint
             **kwargs: Additional arguments
@@ -645,12 +659,24 @@ class ContactGraspNetSelector(GraspSelector):
             info["fallback_reason"] = self._load_error or "model_not_loaded"
             return self._fallback_heuristic(obj_pose, obj_name, approach_strategy, info)
 
+        # Early check: hollow objects are better handled by heuristic rim-grasp
+        # Do this BEFORE expensive point cloud generation and inference
+        obj_name_lower = obj_name.lower()
+        is_hollow = any(hollow in obj_name_lower for hollow in ['bowl', 'mug', 'cup', 'ramekin'])
+
+        if is_hollow:
+            info["fallback"] = True
+            info["fallback_reason"] = f"hollow_object_fallback ({obj_name})"
+            return self._fallback_heuristic(obj_pose, obj_name, approach_strategy, info)
+
         # Get or create point cloud
         if point_cloud is None:
             if depth_image is not None and camera_intrinsics is not None:
                 point_cloud = self._depth_to_pointcloud(
-                    depth_image, camera_intrinsics, segmentation_mask
+                    depth_image, camera_intrinsics, camera_extrinsics, segmentation_mask
                 )
+                info["point_cloud_source"] = "depth_image"
+                info["point_cloud_size"] = point_cloud.shape[0] if point_cloud is not None else 0
             else:
                 info["fallback"] = True
                 info["fallback_reason"] = "no_point_cloud_or_depth"
@@ -670,10 +696,36 @@ class ContactGraspNetSelector(GraspSelector):
                 info["fallback_reason"] = "no_grasps_found"
                 return self._fallback_heuristic(obj_pose, obj_name, approach_strategy, info)
 
+            # Filter grasps by proximity to target object
+            # CGN returns grasps for the entire scene, so we filter to target
+            # Using tight 8cm threshold to ensure grasps are on the object itself
+            obj_position = obj_pose[:3]
+            max_grasp_distance = 0.08  # 8cm max from object center (tightened from 15cm)
+
+            filtered_grasps = []
+            for g in grasps:
+                dist = np.linalg.norm(g["position"] - obj_position)
+                if dist <= max_grasp_distance:
+                    g["distance_to_object"] = dist
+                    filtered_grasps.append(g)
+
+            info["n_candidates_raw"] = len(grasps)
+            info["n_candidates_filtered"] = len(filtered_grasps)
+
+            if len(filtered_grasps) == 0:
+                info["fallback"] = True
+                info["fallback_reason"] = f"no_grasps_near_object (closest: {min(np.linalg.norm(g['position'] - obj_position) for g in grasps):.3f}m)"
+                return self._fallback_heuristic(obj_pose, obj_name, approach_strategy, info)
+
+            # Re-sort by score (already sorted, but just in case)
+            filtered_grasps.sort(key=lambda g: g["score"], reverse=True)
+            grasps = filtered_grasps
+
             # Convert best grasp to GraspPose
             best_grasp = grasps[0]
             info["n_candidates"] = len(grasps)
             info["best_score"] = float(best_grasp["score"])
+            info["best_grasp_distance"] = float(best_grasp["distance_to_object"])
 
             grasp_pose = GraspPose(
                 position=best_grasp["position"],
@@ -771,20 +823,26 @@ class ContactGraspNetSelector(GraspSelector):
 
         # Filter point cloud by z range
         z_mask = (point_cloud[:, 2] >= self.z_range[0]) & (point_cloud[:, 2] <= self.z_range[1])
-        filtered_pc = point_cloud[z_mask]
+        filtered_pc = point_cloud[z_mask].astype(np.float32)
 
         if filtered_pc.shape[0] < 10:
             return []
 
-        # Run inference
-        # Contact-GraspNet expects point cloud as dict with 'xyz' key
-        pc_dict = {"xyz": filtered_pc}
-
-        pred_grasps, pred_scores, pred_widths = self.grasp_estimator.predict_grasps(
-            pc_dict,
+        # Run inference using predict_scene_grasps
+        # Returns: (pred_grasps_dict, scores_dict, contact_pts_dict, gripper_openings_dict)
+        # Where dicts are keyed by segment id (-1 = all grasps, no segmentation)
+        pred_grasps_dict, pred_scores_dict, contact_pts_dict, gripper_openings_dict = self.grasp_estimator.predict_scene_grasps(
+            filtered_pc,
             forward_passes=self.forward_passes,
-            filter_grasps=self.filter_grasps,
         )
+
+        # Extract grasps from dict (key -1 = unsegmented/all grasps)
+        if -1 not in pred_grasps_dict:
+            return []
+
+        pred_grasps = pred_grasps_dict[-1]  # (N, 4, 4) transform matrices
+        pred_scores = pred_scores_dict[-1]  # (N,) scores
+        gripper_openings = gripper_openings_dict[-1] if -1 in gripper_openings_dict else None  # (N,) widths
 
         # Convert to list of grasp dictionaries
         grasps = []
@@ -800,11 +858,12 @@ class ContactGraspNetSelector(GraspSelector):
                 quat = R.from_matrix(rotation).as_quat()  # [x, y, z, w]
                 orientation = np.array([quat[3], quat[0], quat[1], quat[2]])
 
+                width = float(gripper_openings[i]) if gripper_openings is not None else 0.04
                 grasps.append({
                     "position": position,
                     "orientation": orientation,
                     "score": float(pred_scores[i]),
-                    "width": float(pred_widths[i]) if pred_widths is not None else 0.04,
+                    "width": width,
                     "approach": -rotation[:, 2],  # Z-axis of grasp frame
                 })
 
@@ -816,9 +875,20 @@ class ContactGraspNetSelector(GraspSelector):
         self,
         depth_image: np.ndarray,
         camera_intrinsics: np.ndarray,
+        camera_extrinsics: Optional[np.ndarray] = None,
         segmentation_mask: Optional[np.ndarray] = None,
     ) -> np.ndarray:
-        """Convert depth image to point cloud."""
+        """Convert depth image to point cloud in world frame.
+
+        Args:
+            depth_image: (H, W) depth image in meters
+            camera_intrinsics: (3, 3) camera K matrix
+            camera_extrinsics: (4, 4) camera pose in world frame (T_world_camera)
+            segmentation_mask: Optional (H, W) mask for filtering
+
+        Returns:
+            (N, 3) point cloud in world frame
+        """
         h, w = depth_image.shape[:2]
         fx, fy = camera_intrinsics[0, 0], camera_intrinsics[1, 1]
         cx, cy = camera_intrinsics[0, 2], camera_intrinsics[1, 2]
@@ -829,10 +899,11 @@ class ContactGraspNetSelector(GraspSelector):
         else:
             z = depth_image
 
+        # Unproject to camera frame
         x = (u - cx) * z / fx
         y = (v - cy) * z / fy
 
-        points = np.stack([x, y, z], axis=-1).reshape(-1, 3)
+        points_cam = np.stack([x, y, z], axis=-1).reshape(-1, 3)
         valid = z.flatten() > 0.1
 
         # Apply segmentation mask if provided
@@ -840,7 +911,17 @@ class ContactGraspNetSelector(GraspSelector):
             seg_mask = segmentation_mask.flatten() > 0
             valid = valid & seg_mask
 
-        return points[valid]
+        points_cam = points_cam[valid]
+
+        # Transform to world frame if extrinsics provided
+        if camera_extrinsics is not None and points_cam.shape[0] > 0:
+            # Homogeneous coordinates
+            points_homo = np.hstack([points_cam, np.ones((points_cam.shape[0], 1))])
+            # Transform: p_world = T_world_camera @ p_camera
+            points_world = (camera_extrinsics @ points_homo.T).T[:, :3]
+            return points_world
+
+        return points_cam
 
     def _fallback_heuristic(
         self,

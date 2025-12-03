@@ -23,7 +23,6 @@ from .oracle import OraclePerception
 from .detection.yolo_detector import YOLOObjectDetector
 from .tracking.interface import Detection, TrackingResult
 from .tracking.nearest_neighbor import NearestNeighborTracker
-from .data_collection.collector import instance_id_to_class
 
 
 @dataclass
@@ -356,23 +355,24 @@ class LearnedPerception(PerceptionInterface):
             if det.bbox is None or len(det.bbox) != 4:
                 continue
 
-            # Get bbox center
-            x1, y1, x2, y2 = det.bbox
-            cx = (x1 + x2) / 2
-            cy = (y1 + y2) / 2
+            # Multi-point depth sampling: returns (depth, cx, cy) where cx,cy
+            # are the pixel coordinates of the point with minimum valid depth.
+            # This ensures the back-projection uses consistent depth + pixel coords.
+            depth_result = self._sample_depth_bbox(depth, det.bbox)
 
-            # Sample depth using bbox region (more robust for small objects)
-            # This uses minimum depth within bbox instead of just center
-            z = self._sample_depth_bbox(depth, det.bbox)
+            if depth_result is None:
+                continue
 
-            if z is None or z <= 0:
+            z, cx, cy = depth_result
+
+            if z <= 0:
                 continue
 
             # Skip depth values too close to far plane (likely background)
             if z >= 0.995:
                 continue
 
-            # Back-project to camera frame
+            # Back-project to camera frame using the exact pixel where depth was sampled
             point_cam = self._pixel_to_camera(cx, cy, z)
 
             # Transform to world frame
@@ -401,19 +401,21 @@ class LearnedPerception(PerceptionInterface):
         self,
         depth: np.ndarray,
         bbox: list,
-    ) -> Optional[float]:
-        """Sample depth within a bounding box with robust strategy.
+    ) -> Optional[tuple]:
+        """Sample depth within a bounding box with multi-point strategy.
 
-        For small objects like bowls, sampling just the center often
+        For small objects like bowls, sampling just the bbox center often
         picks up background. Instead, sample multiple points within
-        the bbox and use the closest (minimum) valid depth.
+        the bbox and return the point with the closest (minimum) valid depth
+        along with its pixel coordinates for accurate back-projection.
 
         Args:
             depth: Depth image (H, W)
             bbox: Bounding box [x1, y1, x2, y2]
 
         Returns:
-            Depth value or None if invalid
+            Tuple of (depth, cx, cy) where cx,cy are pixel coords of the
+            sampled point, or None if no valid depth found
         """
         h, w = depth.shape
         x1, y1, x2, y2 = [int(c) for c in bbox]
@@ -427,21 +429,53 @@ class LearnedPerception(PerceptionInterface):
         if x2 <= x1 or y2 <= y1:
             return None
 
-        # Extract bbox region
-        patch = depth[y1:y2, x1:x2]
+        # Multi-point sampling: sample a grid of points within the bbox
+        # This gives us better coverage than just the center
+        bbox_w = x2 - x1
+        bbox_h = y2 - y1
 
-        # Filter valid depth values (not at far plane)
-        # MuJoCo depth: 0 = near plane, 1 = far plane (normalized)
-        # Values very close to 1.0 are typically background
-        valid_mask = (patch > 0) & (patch < 0.995) & np.isfinite(patch)
-        valid_depths = patch[valid_mask]
+        # Sample points: center + 4 points at 25% and 75% of bbox dimensions
+        # For a 3x3 grid, gives 9 sample points
+        sample_fracs = [0.25, 0.5, 0.75]
+        sample_points = []
 
-        if len(valid_depths) == 0:
+        for fx in sample_fracs:
+            for fy in sample_fracs:
+                px = int(x1 + bbox_w * fx)
+                py = int(y1 + bbox_h * fy)
+                if 0 <= px < w and 0 <= py < h:
+                    sample_points.append((px, py))
+
+        # Find the point with minimum valid depth (closest to camera = on object)
+        best_depth = None
+        best_cx, best_cy = None, None
+
+        for px, py in sample_points:
+            # Sample a small 3x3 patch around each point for robustness
+            patch_half = 1
+            py_min = max(0, py - patch_half)
+            py_max = min(h, py + patch_half + 1)
+            px_min = max(0, px - patch_half)
+            px_max = min(w, px + patch_half + 1)
+
+            patch = depth[py_min:py_max, px_min:px_max]
+
+            # Filter valid depth values (not at far plane)
+            # MuJoCo depth: 0 = near plane, 1 = far plane (normalized)
+            valid_mask = (patch > 0) & (patch < 0.995) & np.isfinite(patch)
+            valid_depths = patch[valid_mask]
+
+            if len(valid_depths) > 0:
+                min_depth = float(np.min(valid_depths))
+                if best_depth is None or min_depth < best_depth:
+                    best_depth = min_depth
+                    best_cx = float(px)
+                    best_cy = float(py)
+
+        if best_depth is None:
             return None
 
-        # Use the closest depth (minimum) - this is more robust for
-        # small objects where background can dominate the bbox
-        return float(np.min(valid_depths))
+        return (best_depth, best_cx, best_cy)
 
     def _sample_depth(
         self,
