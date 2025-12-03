@@ -10,10 +10,20 @@ from .move import MoveSkill
 from .place import PlaceSkill
 from .drawer import OpenDrawerSkill, CloseDrawerSkill
 from .stove import TurnOnStoveSkill, TurnOffStoveSkill
+from .grasp_selection import (
+    GraspSelector,
+    GraspPose,
+    HeuristicGraspSelector,
+    GIGAGraspSelector,
+    get_grasp_selector,
+    register_grasp_selector,
+)
 
 __all__ = [
+    # Base classes
     "Skill",
     "SkillResult",
+    # Manipulation skills
     "ApproachSkill",
     "GraspSkill",
     "MoveSkill",
@@ -22,6 +32,13 @@ __all__ = [
     "CloseDrawerSkill",
     "TurnOnStoveSkill",
     "TurnOffStoveSkill",
+    # Grasp selection
+    "GraspSelector",
+    "GraspPose",
+    "HeuristicGraspSelector",
+    "GIGAGraspSelector",
+    "get_grasp_selector",
+    "register_grasp_selector",
 ]
 
 

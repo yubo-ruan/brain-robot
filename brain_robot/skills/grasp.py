@@ -8,6 +8,7 @@ from typing import Dict, Any, Tuple, Optional
 import numpy as np
 
 from .base import Skill, SkillResult
+from .grasp_selection import GraspSelector, HeuristicGraspSelector, get_grasp_selector
 from ..world_model.state import WorldState
 from ..control.cartesian_pd import CartesianPDController
 from ..config import SkillConfig
@@ -22,6 +23,10 @@ class GraspSkill(Skill):
 
     For hollow objects (bowls, mugs, cups), targets the rim rather than
     center to avoid "ghost grasps" where fingers descend into empty interior.
+
+    Supports pluggable grasp selection via GraspSelector interface:
+    - HeuristicGraspSelector: Rule-based (default)
+    - GIGAGraspSelector: 6-DoF learned affordances
 
     Preconditions:
     - Object exists in world state
@@ -59,6 +64,8 @@ class GraspSkill(Skill):
         lift_height: float = 0.05,
         grasp_height_offset: float = 0.04,  # Grasp 4cm above body origin to hit rim
         config: Optional[SkillConfig] = None,
+        grasp_selector: Optional[GraspSelector] = None,
+        grasp_selector_type: str = "heuristic",
     ):
         """Initialize GraspSkill.
 
@@ -68,6 +75,8 @@ class GraspSkill(Skill):
             grasp_height_offset: Height relative to object center to grasp.
                                  0 = center, negative = below center (for cylinders).
             config: Optional configuration.
+            grasp_selector: Custom GraspSelector instance (overrides grasp_selector_type).
+            grasp_selector_type: Type of grasp selector ("heuristic" or "giga").
         """
         super().__init__(max_steps=max_steps, config=config)
 
@@ -89,6 +98,15 @@ class GraspSkill(Skill):
 
         self.grasp_height_offset = grasp_height_offset
         self.controller = CartesianPDController.from_config(self.config)
+
+        # Initialize grasp selector
+        if grasp_selector is not None:
+            self.grasp_selector = grasp_selector
+        else:
+            self.grasp_selector = get_grasp_selector(
+                grasp_selector_type,
+                grasp_height_offset=grasp_height_offset,
+            )
     
     def preconditions(self, world_state: WorldState, args: Dict[str, Any]) -> Tuple[bool, str]:
         """Check grasp preconditions.
@@ -574,10 +592,13 @@ class GraspSkill(Skill):
         world_state: WorldState,
         gripper_pose: np.ndarray,
     ) -> Tuple[np.ndarray, Dict[str, Any]]:
-        """Compute optimal grasp point based on object geometry.
+        """Compute optimal grasp point using the configured GraspSelector.
 
         For hollow objects (bowls, mugs), offsets toward the rim.
         For solid objects, targets the center.
+
+        This method now delegates to self.grasp_selector for the actual
+        grasp point computation, allowing swappable strategies (heuristic, GIGA, etc.)
 
         Args:
             obj_pose: Object pose [x, y, z, qw, qx, qy, qz]
@@ -588,8 +609,6 @@ class GraspSkill(Skill):
         Returns:
             Tuple of (grasp_target_xyz, info_dict)
         """
-        info = {"grasp_strategy": "center", "rim_offset": 0.0}
-
         # Get object type from world state
         obj_type = None
         if obj_name in world_state.objects:
@@ -603,62 +622,20 @@ class GraspSkill(Skill):
                     obj_type = hollow_type
                     break
 
-        # Check if this is a hollow object needing rim grasp
-        if obj_type and obj_type.lower() in self.HOLLOW_OBJECTS:
-            # Get object radius (use default if not found)
-            radius = self.OBJECT_RADII.get(obj_type.lower(), 0.05)
+        # Get approach strategy from world state
+        approach_strategy = getattr(world_state, 'approach_strategy', 'top_down')
 
-            # Compute rim offset: we want gripper center at rim
-            # offset = radius - finger_half_width (so fingers straddle rim)
-            rim_offset = radius - self.GRIPPER_FINGER_HALF_WIDTH
+        # Use grasp selector to compute grasp pose
+        grasp_pose, info = self.grasp_selector.select_grasp(
+            obj_pose=obj_pose,
+            obj_name=obj_name,
+            obj_type=obj_type,
+            gripper_pose=gripper_pose,
+            approach_strategy=approach_strategy,
+        )
 
-            # Direction for rim offset depends on approach strategy
-            # For front_angled approaches (object behind robot), offset toward +Y (away from robot)
-            # This places the grasp point in more reachable workspace
-            approach_strategy = getattr(world_state, 'approach_strategy', 'top_down')
-
-            if approach_strategy in ('front_angled', 'front_angled_steep'):
-                # Object is behind robot - offset toward +Y (front of object, away from robot)
-                # This keeps the grasp point in reachable workspace
-                direction = np.array([0.0, 1.0])  # Toward front (away from robot base)
-            else:
-                # Default: offset toward robot base (-Y in world frame)
-                # This is the most reachable direction for objects in front of robot
-                direction = np.array([0.0, -1.0])  # Fixed: toward robot base
-
-            # Compute grasp point
-            grasp_xy = obj_pose[:2] + direction * rim_offset
-
-            # Clamp Y to workspace limit ONLY for top-down approaches where we offset toward -Y
-            # For front_angled approaches, we offset toward +Y so no clamping needed
-            if approach_strategy not in ('front_angled', 'front_angled_steep'):
-                # Only clamp when offsetting toward robot base (-Y)
-                if grasp_xy[1] < self.MIN_WORKSPACE_Y:
-                    grasp_xy[1] = self.MIN_WORKSPACE_Y
-                    info["y_clamped"] = True
-
-            # For front_angled approaches, we need to grasp LOWER on the rim
-            # because we're coming from the front, not above
-            if approach_strategy in ('front_angled', 'front_angled_steep', 'front_horizontal'):
-                # Grasp at rim height (no offset, or even slightly below)
-                grasp_z = obj_pose[2] + 0.02  # Just 2cm above bowl center
-            else:
-                grasp_z = obj_pose[2] + self.grasp_height_offset
-
-            info["grasp_strategy"] = "rim"
-            info["rim_offset"] = rim_offset
-            info["object_type"] = obj_type
-            info["offset_direction"] = direction.tolist()
-
-            return np.array([grasp_xy[0], grasp_xy[1], grasp_z]), info
-
-        # Solid object: target center
-        grasp_xyz = np.array([
-            obj_pose[0],
-            obj_pose[1],
-            obj_pose[2] + self.grasp_height_offset
-        ])
-        return grasp_xyz, info
+        # Return position as numpy array (selector returns GraspPose object)
+        return grasp_pose.position.copy(), info
 
     def update_world_state(
         self,

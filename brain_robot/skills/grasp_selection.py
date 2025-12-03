@@ -1,0 +1,534 @@
+"""Grasp point selection module.
+
+Provides pluggable grasp selection strategies:
+- HeuristicGraspSelector: Rule-based (rim grasps for hollow objects, center for solid)
+- GIGAGraspSelector: 6-DoF grasp affordance model integration
+
+Usage:
+    from brain_robot.skills.grasp_selection import get_grasp_selector
+
+    # Use default (heuristic) selector
+    selector = get_grasp_selector("heuristic")
+
+    # Use GIGA selector (requires GIGA model)
+    selector = get_grasp_selector("giga", model_path="path/to/giga.pth")
+"""
+
+from abc import ABC, abstractmethod
+from dataclasses import dataclass
+from typing import Dict, Any, Optional, List, Tuple
+import numpy as np
+
+
+@dataclass
+class GraspPose:
+    """6-DoF grasp pose with metadata."""
+
+    # Position (3D)
+    position: np.ndarray  # [x, y, z]
+
+    # Orientation (quaternion [w, x, y, z] or rotation matrix)
+    orientation: np.ndarray  # [qw, qx, qy, qz] or 3x3 matrix
+
+    # Gripper width at grasp (meters, 0 = closed, ~0.08 = fully open)
+    gripper_width: float = 0.04
+
+    # Confidence score (0-1, higher is better)
+    confidence: float = 1.0
+
+    # Approach direction (unit vector pointing toward object)
+    approach_direction: Optional[np.ndarray] = None
+
+    # Strategy name for debugging
+    strategy: str = "unknown"
+
+    # Additional metadata
+    metadata: Optional[Dict[str, Any]] = None
+
+    def to_7d(self) -> np.ndarray:
+        """Convert to 7D pose [x, y, z, qw, qx, qy, qz]."""
+        pose = np.zeros(7)
+        pose[:3] = self.position
+
+        if self.orientation.shape == (4,):
+            # Already quaternion
+            pose[3:7] = self.orientation
+        elif self.orientation.shape == (3, 3):
+            # Rotation matrix -> quaternion
+            from scipy.spatial.transform import Rotation as R
+            quat = R.from_matrix(self.orientation).as_quat()  # [x, y, z, w]
+            pose[3:7] = [quat[3], quat[0], quat[1], quat[2]]  # [w, x, y, z]
+        else:
+            # Default orientation (gripper down)
+            pose[3:7] = [-0.02, 0.707, 0.707, -0.02]
+
+        return pose
+
+
+class GraspSelector(ABC):
+    """Abstract base class for grasp selection strategies."""
+
+    @abstractmethod
+    def select_grasp(
+        self,
+        obj_pose: np.ndarray,
+        obj_name: str,
+        obj_type: Optional[str] = None,
+        gripper_pose: Optional[np.ndarray] = None,
+        point_cloud: Optional[np.ndarray] = None,
+        rgb_image: Optional[np.ndarray] = None,
+        depth_image: Optional[np.ndarray] = None,
+        camera_intrinsics: Optional[np.ndarray] = None,
+        approach_strategy: str = "top_down",
+        **kwargs,
+    ) -> Tuple[GraspPose, Dict[str, Any]]:
+        """Select optimal grasp pose for an object.
+
+        Args:
+            obj_pose: Object pose [x, y, z, qw, qx, qy, qz]
+            obj_name: Object name (for heuristic lookup)
+            obj_type: Object type (bowl, mug, cube, etc.)
+            gripper_pose: Current gripper pose (for reachability)
+            point_cloud: Object point cloud (N, 3) for learned methods
+            rgb_image: RGB image for visual methods
+            depth_image: Depth image for visual methods
+            camera_intrinsics: Camera intrinsics (3, 3)
+            approach_strategy: Approach direction hint
+            **kwargs: Additional method-specific arguments
+
+        Returns:
+            Tuple of (GraspPose, info_dict)
+        """
+        pass
+
+    @abstractmethod
+    def select_multiple_grasps(
+        self,
+        obj_pose: np.ndarray,
+        obj_name: str,
+        n_grasps: int = 5,
+        **kwargs,
+    ) -> List[Tuple[GraspPose, Dict[str, Any]]]:
+        """Select multiple candidate grasp poses, ranked by confidence.
+
+        Args:
+            obj_pose: Object pose
+            obj_name: Object name
+            n_grasps: Number of grasps to return
+            **kwargs: Same as select_grasp
+
+        Returns:
+            List of (GraspPose, info_dict) tuples, sorted by confidence
+        """
+        pass
+
+
+class HeuristicGraspSelector(GraspSelector):
+    """Rule-based grasp selection for known object types.
+
+    Implements the rim-grasp strategy for hollow objects (bowls, mugs)
+    and center grasp for solid objects.
+    """
+
+    # Object types that are hollow and need rim grasping
+    HOLLOW_OBJECTS = {'bowl', 'mug', 'cup', 'ramekin'}
+
+    # Approximate radii for hollow objects (meters)
+    OBJECT_RADII = {
+        'bowl': 0.045,
+        'mug': 0.035,
+        'cup': 0.035,
+        'ramekin': 0.030,
+    }
+
+    # Gripper finger half-width (meters)
+    GRIPPER_FINGER_HALF_WIDTH = 0.005
+
+    # Workspace limits
+    MIN_WORKSPACE_Y = 0.12
+
+    # Default gripper-down orientation [w, x, y, z]
+    DEFAULT_ORIENTATION = np.array([-0.02, 0.707, 0.707, -0.02])
+
+    def __init__(
+        self,
+        grasp_height_offset: float = 0.04,
+        default_gripper_width: float = 0.04,
+    ):
+        """Initialize heuristic selector.
+
+        Args:
+            grasp_height_offset: Height above object center to grasp
+            default_gripper_width: Default gripper width for grasps
+        """
+        self.grasp_height_offset = grasp_height_offset
+        self.default_gripper_width = default_gripper_width
+
+    def select_grasp(
+        self,
+        obj_pose: np.ndarray,
+        obj_name: str,
+        obj_type: Optional[str] = None,
+        gripper_pose: Optional[np.ndarray] = None,
+        approach_strategy: str = "top_down",
+        **kwargs,
+    ) -> Tuple[GraspPose, Dict[str, Any]]:
+        """Select grasp using heuristic rules."""
+        info = {"grasp_strategy": "center", "rim_offset": 0.0}
+
+        # Infer object type from name if not provided
+        if obj_type is None:
+            obj_name_lower = obj_name.lower()
+            for hollow_type in self.HOLLOW_OBJECTS:
+                if hollow_type in obj_name_lower:
+                    obj_type = hollow_type
+                    break
+
+        # Check if hollow object needing rim grasp
+        if obj_type and obj_type.lower() in self.HOLLOW_OBJECTS:
+            grasp_pose, rim_info = self._compute_rim_grasp(
+                obj_pose, obj_type, approach_strategy
+            )
+            info.update(rim_info)
+            info["object_type"] = obj_type
+        else:
+            # Solid object: center grasp
+            grasp_pose = self._compute_center_grasp(obj_pose)
+            info["object_type"] = obj_type or "solid"
+
+        return grasp_pose, info
+
+    def select_multiple_grasps(
+        self,
+        obj_pose: np.ndarray,
+        obj_name: str,
+        n_grasps: int = 5,
+        **kwargs,
+    ) -> List[Tuple[GraspPose, Dict[str, Any]]]:
+        """Return multiple grasp candidates.
+
+        For heuristic selector, returns variations around the primary grasp.
+        """
+        primary, info = self.select_grasp(obj_pose, obj_name, **kwargs)
+        results = [(primary, info)]
+
+        # Add variations (different rim positions for hollow objects)
+        obj_type = info.get("object_type", "solid")
+        if obj_type in self.HOLLOW_OBJECTS:
+            # Add grasps at different rim positions (0, 90, 180, 270 degrees)
+            for angle in [np.pi/2, np.pi, -np.pi/2]:
+                varied = self._vary_rim_angle(primary, angle)
+                varied_info = info.copy()
+                varied_info["rim_angle"] = float(angle)
+                varied_info["confidence"] = 0.8  # Lower than primary
+                results.append((varied, varied_info))
+                if len(results) >= n_grasps:
+                    break
+
+        return results[:n_grasps]
+
+    def _compute_rim_grasp(
+        self,
+        obj_pose: np.ndarray,
+        obj_type: str,
+        approach_strategy: str,
+    ) -> Tuple[GraspPose, Dict[str, Any]]:
+        """Compute rim grasp for hollow object."""
+        info = {"grasp_strategy": "rim"}
+
+        radius = self.OBJECT_RADII.get(obj_type.lower(), 0.05)
+        rim_offset = radius - self.GRIPPER_FINGER_HALF_WIDTH
+        info["rim_offset"] = rim_offset
+
+        # Determine offset direction based on approach
+        if approach_strategy in ('front_angled', 'front_angled_steep'):
+            direction = np.array([0.0, 1.0])  # Toward front (away from robot)
+        else:
+            direction = np.array([0.0, -1.0])  # Toward robot base
+
+        info["offset_direction"] = direction.tolist()
+
+        # Compute grasp XY
+        grasp_xy = obj_pose[:2] + direction * rim_offset
+
+        # Clamp Y for top-down approaches
+        if approach_strategy not in ('front_angled', 'front_angled_steep'):
+            if grasp_xy[1] < self.MIN_WORKSPACE_Y:
+                grasp_xy[1] = self.MIN_WORKSPACE_Y
+                info["y_clamped"] = True
+
+        # Compute grasp Z based on approach
+        if approach_strategy in ('front_angled', 'front_angled_steep', 'front_horizontal'):
+            grasp_z = obj_pose[2] + 0.02  # Just above bowl center
+        else:
+            grasp_z = obj_pose[2] + self.grasp_height_offset
+
+        grasp_pose = GraspPose(
+            position=np.array([grasp_xy[0], grasp_xy[1], grasp_z]),
+            orientation=self.DEFAULT_ORIENTATION.copy(),
+            gripper_width=self.default_gripper_width,
+            confidence=0.9,
+            strategy="rim",
+            metadata=info,
+        )
+
+        return grasp_pose, info
+
+    def _compute_center_grasp(self, obj_pose: np.ndarray) -> GraspPose:
+        """Compute center grasp for solid object."""
+        return GraspPose(
+            position=np.array([
+                obj_pose[0],
+                obj_pose[1],
+                obj_pose[2] + self.grasp_height_offset,
+            ]),
+            orientation=self.DEFAULT_ORIENTATION.copy(),
+            gripper_width=self.default_gripper_width,
+            confidence=0.9,
+            strategy="center",
+        )
+
+    def _vary_rim_angle(self, grasp: GraspPose, angle: float) -> GraspPose:
+        """Create a grasp variation at different rim angle."""
+        # Rotate the XY offset around object center
+        cos_a, sin_a = np.cos(angle), np.sin(angle)
+        rotation = np.array([[cos_a, -sin_a], [sin_a, cos_a]])
+
+        # Get offset from original (approximate from metadata)
+        if grasp.metadata and "rim_offset" in grasp.metadata:
+            offset = grasp.metadata["rim_offset"]
+            direction = np.array(grasp.metadata.get("offset_direction", [0, -1]))
+            new_direction = rotation @ direction
+
+            # Compute new position (need original obj center)
+            # This is approximate since we don't have obj_pose here
+            original_offset = direction * offset
+            new_offset = new_direction * offset
+            delta = new_offset - original_offset
+            new_pos = grasp.position.copy()
+            new_pos[:2] += delta
+        else:
+            new_pos = grasp.position.copy()
+
+        return GraspPose(
+            position=new_pos,
+            orientation=grasp.orientation.copy(),
+            gripper_width=grasp.gripper_width,
+            confidence=grasp.confidence * 0.9,
+            strategy=grasp.strategy,
+            metadata=grasp.metadata,
+        )
+
+
+class GIGAGraspSelector(GraspSelector):
+    """6-DoF grasp affordance model (GIGA) integration.
+
+    GIGA predicts dense grasp affordances from point clouds or depth images.
+    This selector loads a pre-trained GIGA model and queries it for grasp poses.
+
+    Paper: https://arxiv.org/abs/2104.01542
+
+    Note: This is a stub implementation. Full integration requires:
+    1. GIGA model weights (giga.pth)
+    2. Point cloud extraction from LIBERO observations
+    3. Coordinate frame transformations (camera -> world)
+    """
+
+    def __init__(
+        self,
+        model_path: Optional[str] = None,
+        device: str = "cuda",
+        voxel_size: float = 0.005,
+        score_threshold: float = 0.5,
+        grasp_height_offset: float = 0.04,  # Ignored by GIGA, but accepted for compatibility
+        **kwargs,  # Accept additional kwargs for compatibility
+    ):
+        """Initialize GIGA selector.
+
+        Args:
+            model_path: Path to GIGA model weights
+            device: Device for inference ("cuda" or "cpu")
+            voxel_size: Voxel size for point cloud processing
+            score_threshold: Minimum grasp quality score
+        """
+        self.model_path = model_path
+        self.device = device
+        self.voxel_size = voxel_size
+        self.score_threshold = score_threshold
+
+        self.model = None
+        if model_path:
+            self._load_model(model_path)
+
+    def _load_model(self, model_path: str):
+        """Load GIGA model from checkpoint."""
+        try:
+            import torch
+            # GIGA model loading would go here
+            # self.model = GIGANet.load(model_path)
+            # self.model.to(self.device)
+            # self.model.eval()
+            print(f"[GIGAGraspSelector] Model loading not implemented: {model_path}")
+        except ImportError:
+            print("[GIGAGraspSelector] PyTorch not available for model loading")
+
+    def select_grasp(
+        self,
+        obj_pose: np.ndarray,
+        obj_name: str,
+        obj_type: Optional[str] = None,
+        gripper_pose: Optional[np.ndarray] = None,
+        point_cloud: Optional[np.ndarray] = None,
+        rgb_image: Optional[np.ndarray] = None,
+        depth_image: Optional[np.ndarray] = None,
+        camera_intrinsics: Optional[np.ndarray] = None,
+        approach_strategy: str = "top_down",
+        **kwargs,
+    ) -> Tuple[GraspPose, Dict[str, Any]]:
+        """Select grasp using GIGA model.
+
+        Requires point_cloud or (depth_image + camera_intrinsics).
+        Falls back to heuristic if model not loaded or inputs missing.
+        """
+        info = {"method": "giga", "fallback": False}
+
+        # Check if we can run GIGA
+        if self.model is None:
+            info["fallback"] = True
+            info["fallback_reason"] = "model_not_loaded"
+            return self._fallback_heuristic(obj_pose, obj_name, approach_strategy, info)
+
+        if point_cloud is None:
+            if depth_image is not None and camera_intrinsics is not None:
+                point_cloud = self._depth_to_pointcloud(depth_image, camera_intrinsics)
+            else:
+                info["fallback"] = True
+                info["fallback_reason"] = "no_point_cloud"
+                return self._fallback_heuristic(obj_pose, obj_name, approach_strategy, info)
+
+        # Run GIGA inference
+        try:
+            grasps = self._run_giga_inference(point_cloud)
+            if len(grasps) == 0:
+                info["fallback"] = True
+                info["fallback_reason"] = "no_grasps_found"
+                return self._fallback_heuristic(obj_pose, obj_name, approach_strategy, info)
+
+            # Return best grasp
+            best_grasp = grasps[0]
+            info["n_candidates"] = len(grasps)
+            info["best_score"] = best_grasp.confidence
+            return best_grasp, info
+
+        except Exception as e:
+            info["fallback"] = True
+            info["fallback_reason"] = f"inference_error: {e}"
+            return self._fallback_heuristic(obj_pose, obj_name, approach_strategy, info)
+
+    def select_multiple_grasps(
+        self,
+        obj_pose: np.ndarray,
+        obj_name: str,
+        n_grasps: int = 5,
+        **kwargs,
+    ) -> List[Tuple[GraspPose, Dict[str, Any]]]:
+        """Select multiple grasp candidates from GIGA."""
+        # For now, just return variations from single grasp
+        primary, info = self.select_grasp(obj_pose, obj_name, **kwargs)
+
+        if info.get("fallback"):
+            # Use heuristic fallback for multiple grasps
+            heuristic = HeuristicGraspSelector()
+            return heuristic.select_multiple_grasps(obj_pose, obj_name, n_grasps, **kwargs)
+
+        # TODO: Implement full GIGA multi-grasp selection
+        return [(primary, info)]
+
+    def _run_giga_inference(self, point_cloud: np.ndarray) -> List[GraspPose]:
+        """Run GIGA inference on point cloud.
+
+        This is a stub - actual implementation would:
+        1. Voxelize point cloud
+        2. Run through GIGA network
+        3. Extract top-k grasp poses
+        4. Transform to world frame
+        """
+        # Placeholder - return empty list to trigger fallback
+        return []
+
+    def _depth_to_pointcloud(
+        self,
+        depth_image: np.ndarray,
+        camera_intrinsics: np.ndarray,
+    ) -> np.ndarray:
+        """Convert depth image to point cloud."""
+        # Standard depth -> pointcloud conversion
+        h, w = depth_image.shape
+        fx, fy = camera_intrinsics[0, 0], camera_intrinsics[1, 1]
+        cx, cy = camera_intrinsics[0, 2], camera_intrinsics[1, 2]
+
+        u, v = np.meshgrid(np.arange(w), np.arange(h))
+        z = depth_image
+        x = (u - cx) * z / fx
+        y = (v - cy) * z / fy
+
+        points = np.stack([x, y, z], axis=-1).reshape(-1, 3)
+        valid = z.flatten() > 0
+        return points[valid]
+
+    def _fallback_heuristic(
+        self,
+        obj_pose: np.ndarray,
+        obj_name: str,
+        approach_strategy: str,
+        info: Dict[str, Any],
+    ) -> Tuple[GraspPose, Dict[str, Any]]:
+        """Fall back to heuristic grasp selection."""
+        heuristic = HeuristicGraspSelector()
+        grasp, heuristic_info = heuristic.select_grasp(
+            obj_pose, obj_name, approach_strategy=approach_strategy
+        )
+        info.update(heuristic_info)
+        return grasp, info
+
+
+# Factory function for creating selectors
+_SELECTOR_REGISTRY = {
+    "heuristic": HeuristicGraspSelector,
+    "giga": GIGAGraspSelector,
+}
+
+
+def get_grasp_selector(
+    selector_type: str = "heuristic",
+    **kwargs,
+) -> GraspSelector:
+    """Factory function to create grasp selectors.
+
+    Args:
+        selector_type: Type of selector ("heuristic" or "giga")
+        **kwargs: Arguments passed to selector constructor
+
+    Returns:
+        GraspSelector instance
+
+    Raises:
+        ValueError: If selector_type is unknown
+    """
+    if selector_type not in _SELECTOR_REGISTRY:
+        raise ValueError(
+            f"Unknown selector type: {selector_type}. "
+            f"Available: {list(_SELECTOR_REGISTRY.keys())}"
+        )
+
+    return _SELECTOR_REGISTRY[selector_type](**kwargs)
+
+
+def register_grasp_selector(name: str, selector_class: type):
+    """Register a custom grasp selector.
+
+    Args:
+        name: Name for the selector
+        selector_class: Class implementing GraspSelector interface
+    """
+    _SELECTOR_REGISTRY[name] = selector_class
