@@ -9,6 +9,11 @@ import numpy as np
 from .base import Skill, SkillResult
 from ..world_model.state import WorldState
 from ..control.cartesian_pd import CartesianPDController, compute_pregrasp_pose
+from ..control.approach_selection import (
+    select_approach_strategy,
+    compute_angled_pregrasp_pose,
+    APPROACH_ORIENTATIONS,
+)
 from ..config import SkillConfig
 
 
@@ -103,7 +108,7 @@ class ApproachSkill(Skill):
         return True, "OK"
     
     def execute(self, env, world_state: WorldState, args: Dict[str, Any]) -> SkillResult:
-        """Execute approach motion."""
+        """Execute approach motion with adaptive approach direction."""
         obj_name = args.get("obj")
 
         # Get target object pose
@@ -126,10 +131,44 @@ class ApproachSkill(Skill):
             current_pose = self._get_gripper_pose(env, obs)
             last_obs = obs
 
-        # Compute pre-grasp target with current gripper orientation
-        gripper_ori = current_pose[3:7] if current_pose is not None else None
-        target_pose = compute_pregrasp_pose(obj_pose, self.pregrasp_height, gripper_orientation=gripper_ori)
-        self.controller.set_target(target_pose, gripper=1.0)  # Open gripper
+        # Determine object context for approach selection
+        obj_type = None
+        if obj_name in world_state.objects:
+            obj_type = world_state.objects[obj_name].object_type
+
+        # Check if object is inside a drawer/cabinet (using spatial relations)
+        in_drawer = False
+        if obj_name in world_state.inside:
+            container = world_state.inside[obj_name]
+            in_drawer = any(x in container.lower() for x in ['drawer', 'cabinet'])
+        # Fallback to name-based check
+        if not in_drawer:
+            in_drawer = 'drawer' in obj_name.lower() or (obj_type and 'drawer' in str(obj_type).lower())
+
+        on_elevated = obj_pose[2] > 1.05  # Above normal table height
+
+        # Select optimal approach strategy based on object position
+        strategy_name, approach_dir, gripper_ori = select_approach_strategy(
+            obj_pos=obj_pose[:3],
+            in_drawer=in_drawer,
+            on_elevated_surface=on_elevated,
+        )
+
+        # Compute pre-grasp pose using selected approach
+        target_pose = compute_angled_pregrasp_pose(
+            object_pose=obj_pose,
+            approach_direction=approach_dir,
+            gripper_orientation=gripper_ori,
+            pregrasp_distance=self.pregrasp_height,
+        )
+
+        # Store approach strategy in world state for use by GraspSkill
+        world_state.approach_strategy = strategy_name
+        world_state.approach_direction = approach_dir
+        world_state.gripper_orientation = gripper_ori
+
+        # NOTE: In robosuite OSC, action[6] = -1.0 opens gripper, +1.0 closes
+        self.controller.set_target(target_pose, gripper=-1.0)  # Open gripper (inverted)
 
         for step in range(self.max_steps):
             steps_taken = step + 1
@@ -156,11 +195,14 @@ class ApproachSkill(Skill):
                         "final_error": self.controller.position_error(current_pose),
                         "xy_error": xy_error,
                         "z_error": z_error,
+                        "approach_strategy": strategy_name,
                     }
                 )
 
             # Compute and apply action
             action = self.controller.compute_action(current_pose)
+            # Zero out orientation control - position-only control is more reliable
+            action[3:6] = 0.0
             obs, _, _, _ = self._step_env(env, action)
             current_pose = self._get_gripper_pose(env, obs)
             last_obs = obs

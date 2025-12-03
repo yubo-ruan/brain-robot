@@ -85,12 +85,24 @@ class PlaceSkill(Skill):
             if target_pose is not None:
                 # Place above target object
                 return target_pose[2] + 0.05  # 5cm above target
-        
+
         # Default to table height + release offset
         return 0.02 + self.release_height
+
+    def _get_live_target_position(self, env, target: str) -> np.ndarray:
+        """Get real-time target position from simulator.
+
+        This is critical for accurate placement since objects may move
+        during the place skill execution.
+        """
+        try:
+            body_id = env.sim.model.body_name2id(target)
+            return env.sim.data.body_xpos[body_id].copy()
+        except (ValueError, AttributeError):
+            return None
     
     def execute(self, env, world_state: WorldState, args: Dict[str, Any]) -> SkillResult:
-        """Execute place: lower and release."""
+        """Execute place: center over target, lower, and release."""
         obj_name = args.get("obj")
         target = args.get("region") or args.get("target")
 
@@ -112,15 +124,119 @@ class PlaceSkill(Skill):
         current_pose = np.array(current_pose) if not isinstance(current_pose, np.ndarray) else current_pose
 
         steps_taken = 0
-        steps_per_phase = self.max_steps // 2
+        # Allocate steps: lift (15%), XY centering (25%), lower (30%), release (30%)
+        lift_steps = self.max_steps // 7
+        xy_center_steps = self.max_steps // 4
+        lower_steps = self.max_steps // 3
+        release_steps = self.max_steps - lift_steps - xy_center_steps - lower_steps
 
-        # Phase 1: Lower to release height
+        # Get target XY position
+        target_pos = None
+        if target in world_state.objects:
+            target_pos = world_state.get_object_position(target)
+
+        xy_error_before = 0.0
+        xy_error_after = 0.0
+
+        # Phase -1: LIFT before centering to avoid collision
+        # Critical fix: Bowl may be at same height as plate after Move skill
+        # Must lift to safe height before any lateral movement
+        safe_clearance = 0.05  # 5cm above target surface
+        if target_pos is not None:
+            target_surface_z = target_pos[2] + 0.02  # Approximate surface height
+            required_z = target_surface_z + safe_clearance
+
+            if current_pose[2] < required_z:
+                lift_target = current_pose.copy()
+                lift_target[2] = required_z
+                self.controller.set_target(lift_target, gripper=1.0)  # Keep closed
+
+                for step in range(lift_steps):
+                    steps_taken += 1
+                    if current_pose is None:
+                        break
+
+                    z_error = required_z - current_pose[2]
+                    if z_error < 0.01:  # Within 1cm of target height
+                        break
+
+                    action = self.controller.compute_action(current_pose)
+                    # Zero out orientation control - same fix as grasp
+                    action[3:6] = 0.0
+                    obs, _, _, _ = self._step_env(env, action)
+                    current_pose = self._get_gripper_pose(env, obs)
+                    last_obs = obs
+
+        # Phase 0: XY Centering with GRASP OFFSET COMPENSATION
+        # Critical for LIBERO success which requires <3cm XY precision
+        #
+        # KEY INSIGHT: For rim grasps, bowl_center != gripper_center
+        # grasp_offset_xy = bowl_center - gripper_center (computed during grasp)
+        # To place bowl_center over plate_center:
+        #   desired_gripper_pos = plate_center - grasp_offset_xy
+        #
+        # We also use real-time tracking since the plate may move
+
+        # Get grasp offset (defaults to [0,0] if not available)
+        grasp_offset = getattr(world_state, 'grasp_offset_xy', np.zeros(2))
+        if grasp_offset is None:
+            grasp_offset = np.zeros(2)
+        grasp_offset = np.array(grasp_offset)
+
+        if target_pos is not None:
+            # Compute where gripper should be so that OBJECT center is over target
+            # gripper_target = plate_center - offset
+            gripper_target_xy = target_pos[:2] - grasp_offset
+            xy_error_before = np.linalg.norm(current_pose[:2] - gripper_target_xy)
+
+            if xy_error_before > 0.015:  # Only if needed (>1.5cm error)
+                for step in range(xy_center_steps):
+                    steps_taken += 1
+                    if current_pose is None:
+                        break
+
+                    # REAL-TIME TRACKING: Get fresh target position every step
+                    live_target = self._get_live_target_position(env, target)
+                    if live_target is not None:
+                        target_pos = live_target
+                        # Recompute gripper target with updated plate position
+                        gripper_target_xy = target_pos[:2] - grasp_offset
+
+                    xy_error = np.linalg.norm(current_pose[:2] - gripper_target_xy)
+                    if xy_error < 0.015:  # 1.5cm threshold - tight for LIBERO
+                        break
+
+                    # Update controller target - move gripper to offset position
+                    center_target = current_pose.copy()
+                    center_target[0] = gripper_target_xy[0]
+                    center_target[1] = gripper_target_xy[1]
+                    # Keep current Z height during centering
+                    self.controller.set_target(center_target, gripper=1.0)  # Keep closed
+
+                    action = self.controller.compute_action(current_pose)
+                    # Zero out orientation control during lateral movement
+                    action[3:6] = 0.0
+                    obs, _, _, _ = self._step_env(env, action)
+                    current_pose = self._get_gripper_pose(env, obs)
+                    last_obs = obs
+
+            # Get final live target for accurate error measurement
+            live_target = self._get_live_target_position(env, target)
+            if live_target is not None:
+                target_pos = live_target
+                gripper_target_xy = target_pos[:2] - grasp_offset
+            xy_error_after = np.linalg.norm(current_pose[:2] - gripper_target_xy) if current_pose is not None else xy_error_before
+
+        # Phase 1: Lower to release height WITH VISUAL SERVO
+        # Track target position during descent to correct for any drift
         target_height = self._get_target_height(world_state, target)
         lower_target = current_pose.copy()
         lower_target[2] = target_height
-        self.controller.set_target(lower_target, gripper=-1.0)  # Keep closed while lowering
+        # NOTE: In robosuite OSC, action[6] = +1.0 closes gripper, -1.0 opens
+        self.controller.set_target(lower_target, gripper=1.0)  # Keep closed while lowering
 
-        for step in range(steps_per_phase):
+        servo_interval = 5  # Check target position every 5 steps
+        for step in range(lower_steps):
             steps_taken += 1
             if current_pose is None:
                 break
@@ -128,17 +244,30 @@ class PlaceSkill(Skill):
             if self.controller.is_at_target(current_pose, pos_threshold=0.02):
                 break
 
+            # VISUAL SERVO: Update XY target based on live plate position
+            if step > 0 and step % servo_interval == 0:
+                live_target = self._get_live_target_position(env, target)
+                if live_target is not None:
+                    # Recompute gripper target with offset compensation
+                    gripper_target_xy = live_target[:2] - grasp_offset
+                    lower_target[0] = gripper_target_xy[0]
+                    lower_target[1] = gripper_target_xy[1]
+                    self.controller.set_target(lower_target, gripper=1.0)
+
             action = self.controller.compute_action(current_pose)
+            # Zero out orientation control during lowering
+            action[3:6] = 0.0
             obs, _, _, _ = self._step_env(env, action)
             current_pose = self._get_gripper_pose(env, obs)
             last_obs = obs
 
         # Phase 2: Open gripper to release
-        for step in range(steps_per_phase):
+        # NOTE: In robosuite OSC, action[6] = -1.0 opens gripper
+        for step in range(release_steps):
             steps_taken += 1
 
             action = np.zeros(7)
-            action[6] = 1.0  # Open gripper
+            action[6] = -1.0  # Open gripper (inverted in robosuite)
             obs, _, _, _ = self._step_env(env, action)
             last_obs = obs
 
@@ -151,6 +280,8 @@ class PlaceSkill(Skill):
                 "final_pose": final_pose,
                 "placed_object": obj_name,
                 "placed_at": target,
+                "xy_error_before": float(xy_error_before),
+                "xy_error_after": float(xy_error_after),
             }
         )
     
