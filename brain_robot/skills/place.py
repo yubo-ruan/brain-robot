@@ -29,28 +29,24 @@ class PlaceSkill(Skill):
     def __init__(
         self,
         max_steps: int = 50,
-        lower_speed: float = 0.02,
         release_height: float = 0.02,
         config: Optional[SkillConfig] = None,
     ):
         """Initialize PlaceSkill.
-        
+
         Args:
             max_steps: Maximum steps before timeout.
-            lower_speed: Speed for lowering.
             release_height: Height above target to release.
             config: Optional configuration.
         """
         super().__init__(max_steps=max_steps, config=config)
-        
+
         if config:
-            self.lower_speed = config.place_lower_speed
             self.release_height = config.place_release_height
             self.max_steps = config.place_max_steps
         else:
-            self.lower_speed = lower_speed
             self.release_height = release_height
-        
+
         self.controller = CartesianPDController.from_config(self.config)
     
     def preconditions(self, world_state: WorldState, args: Dict[str, Any]) -> Tuple[bool, str]:
@@ -89,6 +85,85 @@ class PlaceSkill(Skill):
         # Default to table height + release offset
         return 0.02 + self.release_height
 
+    def _verify_placement(
+        self,
+        env,
+        obj_name: str,
+        target_name: str,
+        target_pos: Optional[np.ndarray],
+        grasp_offset: np.ndarray,
+    ) -> Tuple[bool, dict]:
+        """Verify object was placed correctly near target.
+
+        Args:
+            env: Environment
+            obj_name: Name of placed object
+            target_name: Name of target
+            target_pos: Target position (may be stale, will get live)
+            grasp_offset: Grasp offset used during placement
+
+        Returns:
+            Tuple of (success, info_dict)
+        """
+        info = {}
+
+        # Get live object position
+        obj_pos = self._get_live_object_position(env, obj_name)
+        if obj_pos is None:
+            info["failure_reason"] = "could_not_find_object"
+            return False, info
+
+        # Get live target position
+        live_target = self._get_live_target_position(env, target_name)
+        if live_target is not None:
+            target_pos = live_target
+
+        if target_pos is None:
+            # No target position available, can't verify - be conservative
+            info["failure_reason"] = "no_target_position"
+            return False, info
+
+        # Check XY distance from object center to target center
+        xy_distance = np.linalg.norm(obj_pos[:2] - target_pos[:2])
+        info["final_xy_error"] = float(xy_distance)
+
+        # LIBERO typically requires <3cm XY precision for "on" relation
+        xy_threshold = 0.04  # 4cm - slightly relaxed
+        if xy_distance > xy_threshold:
+            info["failure_reason"] = f"xy_error_too_large ({xy_distance:.3f}m > {xy_threshold}m)"
+            return False, info
+
+        # Check Z is reasonable (object on/above target surface)
+        z_diff = obj_pos[2] - target_pos[2]
+        info["final_z_diff"] = float(z_diff)
+
+        # Object should be within a reasonable band above target
+        # (slightly below is OK due to settling, but not falling through)
+        if z_diff < -0.02:  # More than 2cm below target surface
+            info["failure_reason"] = f"object_below_target (z_diff={z_diff:.3f}m)"
+            return False, info
+
+        return True, info
+
+    def _get_live_object_position(self, env, obj_name: str) -> Optional[np.ndarray]:
+        """Get current object position from simulator."""
+        try:
+            body_name = obj_name
+            try:
+                body_id = env.sim.model.body_name2id(body_name)
+            except ValueError:
+                if body_name.endswith('_main'):
+                    body_name = body_name[:-5]
+                else:
+                    body_name = body_name + '_main'
+                try:
+                    body_id = env.sim.model.body_name2id(body_name)
+                except ValueError:
+                    return None
+            return env.sim.data.body_xpos[body_id].copy()
+        except Exception:
+            return None
+
     def _get_live_target_position(self, env, target: str) -> np.ndarray:
         """Get real-time target position from simulator.
 
@@ -96,7 +171,20 @@ class PlaceSkill(Skill):
         during the place skill execution.
         """
         try:
-            body_id = env.sim.model.body_name2id(target)
+            # Try exact name first
+            body_name = target
+            try:
+                body_id = env.sim.model.body_name2id(body_name)
+            except ValueError:
+                # Try with/without _main suffix
+                if body_name.endswith('_main'):
+                    body_name = body_name[:-5]
+                else:
+                    body_name = body_name + '_main'
+                try:
+                    body_id = env.sim.model.body_name2id(body_name)
+                except ValueError:
+                    return None
             return env.sim.data.body_xpos[body_id].copy()
         except (ValueError, AttributeError):
             return None
@@ -273,17 +361,27 @@ class PlaceSkill(Skill):
 
         final_pose = self._get_gripper_pose(env, last_obs)
 
-        return SkillResult(
-            success=True,
-            info={
-                "steps_taken": steps_taken,
-                "final_pose": final_pose,
-                "placed_object": obj_name,
-                "placed_at": target,
-                "xy_error_before": float(xy_error_before),
-                "xy_error_after": float(xy_error_after),
-            }
+        # Verify placement: check if object is near target
+        placed_successfully, placement_info = self._verify_placement(
+            env, obj_name, target, target_pos, grasp_offset
         )
+
+        result_info = {
+            "steps_taken": steps_taken,
+            "final_pose": final_pose,
+            "placed_object": obj_name,
+            "placed_at": target,
+            "xy_error_before": float(xy_error_before),
+            "xy_error_after": float(xy_error_after),
+            **placement_info,
+        }
+
+        if placed_successfully:
+            return SkillResult(success=True, info=result_info)
+        else:
+            result_info["error_msg"] = f"Placement verification failed: {placement_info.get('failure_reason', 'unknown')}"
+            # Propagate failure - don't mask it
+            return SkillResult(success=False, info=result_info)
     
     def update_world_state(
         self,
@@ -294,22 +392,28 @@ class PlaceSkill(Skill):
         """Update world state after place."""
         obj_name = args.get("obj")
         target = args.get("region") or args.get("target")
-        
+
         # No longer holding
         world_state.set_holding(None)
-        
-        # Update object location
-        if target in world_state.objects:
-            # Placed on/in another object
-            # Determine if it's "in" or "on" based on object type
-            target_obj = world_state.objects.get(target)
-            if target_obj and target_obj.object_type in ['drawer', 'cabinet', 'box', 'container']:
-                world_state.set_inside(obj_name, target)
+
+        # Clear grasp offset - it's no longer valid after releasing
+        if hasattr(world_state, 'grasp_offset_xy'):
+            world_state.grasp_offset_xy = None
+
+        # Only update symbolic state if placement succeeded
+        if result.success:
+            # Update object location
+            if target in world_state.objects:
+                # Placed on/in another object
+                # Determine if it's "in" or "on" based on object type
+                target_obj = world_state.objects.get(target)
+                if target_obj and target_obj.object_type in ['drawer', 'cabinet', 'box', 'container']:
+                    world_state.set_inside(obj_name, target)
+                else:
+                    world_state.set_on(obj_name, target)
             else:
+                # Placed on generic surface/region
                 world_state.set_on(obj_name, target)
-        else:
-            # Placed on generic surface/region
-            world_state.set_on(obj_name, target)
-        
+
         if "final_pose" in result.info and result.info["final_pose"] is not None:
             world_state.gripper_pose = result.info["final_pose"]

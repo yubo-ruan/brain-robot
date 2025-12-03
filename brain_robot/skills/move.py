@@ -150,7 +150,8 @@ class MoveSkill(Skill):
         if current_pose[2] < self.move_height - 0.02:
             up_target = current_pose.copy()
             up_target[2] = self.move_height
-            self.controller.set_target(up_target, gripper=-1.0)  # Keep closed
+            # NOTE: In robosuite OSC, action[6] = +1.0 closes gripper, -1.0 opens
+            self.controller.set_target(up_target, gripper=1.0)  # Keep closed
 
             for step in range(lift_budget):
                 steps_taken += 1
@@ -161,6 +162,8 @@ class MoveSkill(Skill):
                     break
 
                 action = self.controller.compute_action(current_pose)
+                # Zero out orientation control during lift - same fix as grasp/place
+                action[3:6] = 0.0
                 obs, _, _, _ = self._step_env(env, action)
                 current_pose = self._get_gripper_pose(env, obs)
                 last_obs = obs
@@ -173,8 +176,12 @@ class MoveSkill(Skill):
             above_target = current_pose.copy()
             above_target[0] = target_pos[0]
             above_target[1] = target_pos[1]
-            above_target[2] = max(current_pose[2], self.move_height)  # Maintain height
-            self.controller.set_target(above_target, gripper=-1.0)
+            # Ensure gripper stays WELL ABOVE target to avoid collision
+            # The held object hangs ~5-6cm below the gripper, so we need extra clearance
+            # Use max of: current height, move_height, target_z + 10cm clearance
+            min_clearance_above_target = target_pos[2] + 0.10  # 10cm above target
+            above_target[2] = max(current_pose[2], self.move_height, min_clearance_above_target)
+            self.controller.set_target(above_target, gripper=1.0)  # Keep closed
 
             for step in range(translate_budget):
                 steps_taken += 1
@@ -205,7 +212,7 @@ class MoveSkill(Skill):
                         if stuck_counter >= 2 and height_boost < max_height_boost:
                             height_boost += 0.03  # Increase height by 3cm
                             above_target[2] = max(current_pose[2], self.move_height + height_boost)
-                            self.controller.set_target(above_target, gripper=-1.0)
+                            self.controller.set_target(above_target, gripper=1.0)  # Keep closed
                             position_history.clear()  # Reset velocity tracking after adjustment
                             stuck_counter = 0  # Reset stuck counter
 
@@ -216,6 +223,8 @@ class MoveSkill(Skill):
                         stuck_counter = 0
 
                 action = self.controller.compute_action(current_pose)
+                # Zero out orientation control during translation - same fix as grasp/place
+                action[3:6] = 0.0
                 obs, _, _, _ = self._step_env(env, action)
                 current_pose = self._get_gripper_pose(env, obs)
                 last_obs = obs

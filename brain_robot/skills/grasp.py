@@ -10,7 +10,6 @@ import numpy as np
 from .base import Skill, SkillResult
 from ..world_model.state import WorldState
 from ..control.cartesian_pd import CartesianPDController
-from ..control.approach_selection import APPROACH_DIRECTIONS, APPROACH_ORIENTATIONS
 from ..config import SkillConfig
 
 
@@ -52,13 +51,11 @@ class GraspSkill(Skill):
     GRIPPER_FINGER_HALF_WIDTH = 0.005  # ~0.5cm
 
     # Workspace limits - gripper can't reach certain regions without fighting
-    MIN_WORKSPACE_Y = 0.12  # Don't go below Y=0.12m
-    MAX_WORKSPACE_X = -0.06  # Don't go above X=-0.06m (too close to center)
+    MIN_WORKSPACE_Y = 0.12  # Don't go below Y=0.12m for top-down approaches
 
     def __init__(
         self,
-        max_steps: int = 100,  # Increased from 50 for longer descent
-        lower_speed: float = 0.03,  # Increased from 0.02 for faster descent
+        max_steps: int = 100,
         lift_height: float = 0.05,
         grasp_height_offset: float = 0.04,  # Grasp 4cm above body origin to hit rim
         config: Optional[SkillConfig] = None,
@@ -67,7 +64,6 @@ class GraspSkill(Skill):
 
         Args:
             max_steps: Maximum steps before timeout.
-            lower_speed: Speed for lowering gripper (m/step).
             lift_height: Height to lift after grasp.
             grasp_height_offset: Height relative to object center to grasp.
                                  0 = center, negative = below center (for cylinders).
@@ -76,7 +72,6 @@ class GraspSkill(Skill):
         super().__init__(max_steps=max_steps, config=config)
 
         if config:
-            self.lower_speed = config.grasp_lower_speed
             self.lift_height = config.grasp_lift_height
             self.max_steps = config.grasp_max_steps
             # XY refinement config
@@ -85,7 +80,6 @@ class GraspSkill(Skill):
             self.xy_refine_threshold = config.grasp_xy_refine_threshold
             self.xy_refine_min_improvement = config.grasp_xy_refine_min_improvement
         else:
-            self.lower_speed = lower_speed
             self.lift_height = lift_height
             # Default XY refinement settings
             self.xy_refine_enabled = True
@@ -205,13 +199,9 @@ class GraspSkill(Skill):
             current_pose = xy_refine_info.get("final_pose", current_pose)
             last_obs = xy_refine_info.get("last_obs", last_obs)
 
-        # Phase 1: Move along approach direction to grasp point
-        # Get approach direction from world state (set by ApproachSkill)
-        approach_direction = getattr(world_state, 'approach_direction', None)
+        # Phase 1: Descend to grasp point
+        # Get approach strategy from world state (set by ApproachSkill)
         approach_strategy = getattr(world_state, 'approach_strategy', 'top_down')
-
-        if approach_direction is None:
-            approach_direction = APPROACH_DIRECTIONS.get('top_down', np.array([0, 0, -1]))
 
         # Need to refresh current_pose from the environment
         obs, _, _, _ = self._step_env(env, np.zeros(7))
@@ -240,7 +230,8 @@ class GraspSkill(Skill):
 
             # VISUAL SERVO: Check gripper-to-object error periodically
             # Update target if object moved or gripper drifted significantly
-            servo_interval = 10  # Check every 10 steps
+            # Tighter interval (5 steps) for better tracking of bowl movement
+            servo_interval = 5
             if step > 0 and step % servo_interval == 0:
                 live_obj_pos = self._get_live_object_position(env, obj_name)
                 if live_obj_pos is not None:
@@ -497,7 +488,8 @@ class GraspSkill(Skill):
             # Values of 0.0038-0.0050 indicate partial rim grasp
             return 0.003 < width < 0.07
 
-        return True  # Assume success if can't check
+        # Can't verify without gripper data - return False to be conservative
+        return False
 
     def _verify_object_lifted(self, env, obj_name: str, initial_z: float) -> bool:
         """Verify the object was actually lifted by checking its Z position.
@@ -525,8 +517,8 @@ class GraspSkill(Skill):
                 try:
                     body_id = env.sim.model.body_name2id(body_name)
                 except ValueError:
-                    # Can't find object, assume success
-                    return True
+                    # Can't find object - return False to be conservative
+                    return False
 
             current_z = env.sim.data.body_xpos[body_id][2]
 
@@ -538,8 +530,8 @@ class GraspSkill(Skill):
             return lifted
 
         except Exception:
-            # If we can't verify, assume success to avoid false negatives
-            return True
+            # If we can't verify, return False to be conservative
+            return False
     
     def _get_live_object_position(self, env, obj_name: str) -> Optional[np.ndarray]:
         """Get current object position directly from simulator.

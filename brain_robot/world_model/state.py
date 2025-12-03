@@ -78,7 +78,17 @@ class WorldState:
     # Task grounding (set by Qwen semantic grounding)
     task_source: Optional[str] = None  # Object to manipulate
     task_target: Optional[str] = None  # Target location/container
-    
+
+    # Approach/grasp metadata (set by skills, used for coordination)
+    approach_strategy: Optional[str] = None  # e.g., "top_down", "front_angled"
+    approach_direction: Optional[np.ndarray] = None  # Unit vector for approach
+    gripper_orientation: Optional[np.ndarray] = None  # Quaternion for gripper
+    grasp_offset_xy: Optional[np.ndarray] = None  # Offset from object center to gripper
+
+    # Container states (set by drawer/stove skills)
+    drawer_states: Dict[str, str] = field(default_factory=dict)  # drawer → "open"/"closed"
+    stove_on: bool = False
+
     # Uncertainty tracking
     perception_stale: bool = False
     last_perception_time: float = 0.0
