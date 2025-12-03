@@ -46,8 +46,26 @@ class NearestNeighborTracker(TrackerInterface):
         # Use result.to_objects_dict() for PerceptionResult
     """
 
-    # Association threshold (meters) - objects closer than this match
+    # Default association threshold (meters) - objects closer than this match
     association_threshold: float = 0.10
+
+    # Class-specific association thresholds based on object dimensions
+    # Smaller objects need tighter thresholds to avoid mis-associations
+    CLASS_ASSOCIATION_THRESHOLDS: Dict[str, float] = field(default_factory=lambda: {
+        # Small objects (diameter < 10cm)
+        "ramekin": 0.06,       # ~6cm diameter
+        "mug": 0.08,           # ~8cm diameter
+        "can": 0.07,           # ~7cm diameter
+        "bottle": 0.08,        # ~8cm diameter
+        "bowl": 0.10,          # ~10cm diameter
+        # Medium objects
+        "plate": 0.15,         # ~15cm diameter
+        "cookie_box": 0.12,    # ~12cm
+        # Large objects / landmarks
+        "cabinet": 0.25,       # Large, static
+        "stove": 0.25,         # Large, static
+        "drawer": 0.20,        # Medium-large
+    })
 
     # Track lifecycle
     max_misses: int = 10          # Frames without detection before track dies
@@ -145,6 +163,9 @@ class NearestNeighborTracker(TrackerInterface):
             if not class_tracks:
                 continue
 
+            # Get class-specific association threshold
+            class_threshold = self._get_association_threshold(class_name)
+
             # Greedy nearest-neighbor matching
             # (Could use Hungarian algorithm for optimal matching)
             for det_idx, detection in enumerate(class_detections):
@@ -156,7 +177,7 @@ class NearestNeighborTracker(TrackerInterface):
                         continue
 
                     dist = np.linalg.norm(detection.position - track.position)
-                    if dist < best_dist and dist < self.association_threshold:
+                    if dist < best_dist and dist < class_threshold:
                         best_dist = dist
                         best_track = track
 
@@ -260,6 +281,13 @@ class NearestNeighborTracker(TrackerInterface):
         # Multiple available - this shouldn't happen with proper initialization
         # Return the first one (or could use position-based matching)
         return available_ids[0]
+
+    def _get_association_threshold(self, class_name: str) -> float:
+        """Get association threshold for a specific class.
+
+        Uses class-specific thresholds when available, falls back to default.
+        """
+        return self.CLASS_ASSOCIATION_THRESHOLDS.get(class_name, self.association_threshold)
 
     def reset(self):
         """Reset tracker state for new episode."""

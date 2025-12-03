@@ -118,7 +118,8 @@ class OpenDrawerSkill(Skill):
 
         approach_target = current_pose.copy()
         approach_target[:3] = approach_pos
-        self.controller.set_target(approach_target, gripper=1.0)  # Open gripper
+        # NOTE: In robosuite OSC, action[6] = -1.0 opens gripper, +1.0 closes
+        self.controller.set_target(approach_target, gripper=-1.0)  # Open gripper (inverted)
 
         for step in range(self.max_steps // 4):
             steps_taken += 1
@@ -136,7 +137,7 @@ class OpenDrawerSkill(Skill):
         if current_pose is not None:
             grasp_target = current_pose.copy()
             grasp_target[:3] = handle_pos
-            self.controller.set_target(grasp_target, gripper=1.0)
+            self.controller.set_target(grasp_target, gripper=-1.0)  # Keep open
 
             for step in range(self.max_steps // 4):
                 steps_taken += 1
@@ -152,12 +153,12 @@ class OpenDrawerSkill(Skill):
 
         # Phase 3: Close gripper on handle
         if current_pose is not None:
-            self.controller.set_target(current_pose, gripper=-1.0)  # Close
+            self.controller.set_target(current_pose, gripper=1.0)  # Close (inverted)
 
             for step in range(30):
                 steps_taken += 1
                 action = self.controller.compute_action(current_pose)
-                action[-1] = -1.0  # Force close
+                action[-1] = 1.0  # Force close (inverted)
                 obs, _, _, _ = self._step_env(env, action)
                 current_pose = self._get_gripper_pose(env, obs)
 
@@ -166,7 +167,7 @@ class OpenDrawerSkill(Skill):
             pull_target = current_pose.copy()
             pull_target[1] += self.pull_distance  # Pull toward robot
 
-            self.controller.set_target(pull_target, gripper=-1.0)
+            self.controller.set_target(pull_target, gripper=1.0)  # Keep closed (inverted)
 
             for step in range(self.max_steps // 3):
                 steps_taken += 1
@@ -179,7 +180,7 @@ class OpenDrawerSkill(Skill):
                     break
 
                 action = self.controller.compute_action(current_pose)
-                action[-1] = -1.0  # Keep gripper closed
+                action[-1] = 1.0  # Keep gripper closed (inverted)
                 obs, _, _, _ = self._step_env(env, action)
                 current_pose = self._get_gripper_pose(env, obs)
 
@@ -188,7 +189,7 @@ class OpenDrawerSkill(Skill):
             for step in range(20):
                 steps_taken += 1
                 action = np.zeros(7)
-                action[-1] = 1.0  # Open gripper
+                action[-1] = -1.0  # Open gripper (inverted)
                 obs, _, _, _ = self._step_env(env, action)
                 current_pose = self._get_gripper_pose(env, obs)
 
@@ -303,7 +304,8 @@ class CloseDrawerSkill(Skill):
 
         approach_target = current_pose.copy()
         approach_target[:3] = approach_pos
-        self.controller.set_target(approach_target, gripper=-1.0)  # Closed gripper for pushing
+        # NOTE: In robosuite OSC, action[6] = +1.0 closes gripper, -1.0 opens
+        self.controller.set_target(approach_target, gripper=1.0)  # Closed gripper for pushing
 
         for step in range(self.max_steps // 2):
             steps_taken += 1
@@ -322,7 +324,7 @@ class CloseDrawerSkill(Skill):
             push_target = current_pose.copy()
             push_target[1] -= self.push_distance  # Push away from robot
 
-            self.controller.set_target(push_target, gripper=-1.0)
+            self.controller.set_target(push_target, gripper=1.0)  # Keep closed for pushing
 
             for step in range(self.max_steps // 2):
                 steps_taken += 1
@@ -330,7 +332,7 @@ class CloseDrawerSkill(Skill):
                     break
 
                 action = self.controller.compute_action(current_pose)
-                action[-1] = -1.0  # Keep closed for pushing
+                action[-1] = 1.0  # Keep closed for pushing (inverted)
                 obs, _, _, _ = self._step_env(env, action)
                 current_pose = self._get_gripper_pose(env, obs)
 

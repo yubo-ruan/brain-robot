@@ -13,7 +13,9 @@ from .interface import ObjectDetector, Detection
 
 
 # LIBERO object classes (must match training data)
+# Updated for yolo_libero_v2 model with 30 classes
 LIBERO_CLASSES = [
+    # Original 10 classes
     "bowl",
     "plate",
     "mug",
@@ -24,6 +26,27 @@ LIBERO_CLASSES = [
     "can",
     "bottle",
     "stove",
+    # New classes from libero_object and libero_10 suites
+    "alphabet_soup",
+    "cream_cheese",
+    "salad_dressing",
+    "bbq_sauce",
+    "ketchup",
+    "tomato_sauce",
+    "butter",
+    "milk",
+    "chocolate_pudding",
+    "orange_juice",
+    "basket",
+    "moka_pot",
+    "book",
+    "caddy",
+    "microwave",
+    "white_mug",
+    "yellow_white_mug",
+    "wine_bottle",
+    "wine_rack",
+    "frying_pan",
 ]
 
 
@@ -41,7 +64,7 @@ class YOLOObjectDetector(ObjectDetector):
     """
 
     # Model configuration
-    model_path: str = "models/yolo_libero.pt"
+    model_path: str = "models/yolo_libero_v4.pt"  # V4: 12000 images, mAP50-95=0.995 (all 40 LIBERO tasks)
     confidence_threshold: float = 0.5
     iou_threshold: float = 0.45  # For NMS
     device: str = "cuda"

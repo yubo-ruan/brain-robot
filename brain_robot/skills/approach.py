@@ -14,6 +14,10 @@ from ..control.approach_selection import (
     compute_angled_pregrasp_pose,
     APPROACH_ORIENTATIONS,
 )
+from ..control.collision_avoidance import (
+    generate_collision_aware_path,
+    is_waypoint_reached,
+)
 from ..config import SkillConfig
 
 
@@ -108,7 +112,7 @@ class ApproachSkill(Skill):
         return True, "OK"
     
     def execute(self, env, world_state: WorldState, args: Dict[str, Any]) -> SkillResult:
-        """Execute approach motion with adaptive approach direction."""
+        """Execute approach motion with adaptive direction and collision avoidance."""
         obj_name = args.get("obj")
 
         # Get target object pose
@@ -121,7 +125,6 @@ class ApproachSkill(Skill):
 
         steps_taken = 0
         trajectory = []
-        last_obs = None
 
         # Get initial pose from world state
         current_pose = world_state.gripper_pose
@@ -129,7 +132,6 @@ class ApproachSkill(Skill):
             # Do initial step to get observation
             obs, _, _, _ = self._step_env(env, np.zeros(7))
             current_pose = self._get_gripper_pose(env, obs)
-            last_obs = obs
 
         # Determine object context for approach selection
         obj_type = None
@@ -137,13 +139,26 @@ class ApproachSkill(Skill):
             obj_type = world_state.objects[obj_name].object_type
 
         # Check if object is inside a drawer/cabinet (using spatial relations)
+        # Objects INSIDE cabinets/drawers need horizontal approach to reach them
         in_drawer = False
-        if obj_name in world_state.inside:
+        on_cabinet = False
+        if hasattr(world_state, 'inside') and world_state.inside and obj_name in world_state.inside:
             container = world_state.inside[obj_name]
+            # Check for drawer OR cabinet - both require horizontal approach when inside
             in_drawer = any(x in container.lower() for x in ['drawer', 'cabinet'])
         # Fallback to name-based check
         if not in_drawer:
             in_drawer = 'drawer' in obj_name.lower() or (obj_type and 'drawer' in str(obj_type).lower())
+
+        # Check if object is ON TOP of a cabinet (high surface, far from robot)
+        # Cabinet tops are typically at z > 1.15 and require steep angled approach
+        if hasattr(world_state, 'on_top') and world_state.on_top and obj_name in world_state.on_top:
+            surface = world_state.on_top[obj_name]
+            if 'cabinet' in surface.lower():
+                on_cabinet = True
+        # Fallback: high objects (z > 1.15) are likely on cabinet tops
+        if not on_cabinet and obj_pose[2] > 1.15:
+            on_cabinet = True
 
         on_elevated = obj_pose[2] > 1.05  # Above normal table height
 
@@ -152,10 +167,11 @@ class ApproachSkill(Skill):
             obj_pos=obj_pose[:3],
             in_drawer=in_drawer,
             on_elevated_surface=on_elevated,
+            on_cabinet=on_cabinet,
         )
 
-        # Compute pre-grasp pose using selected approach
-        target_pose = compute_angled_pregrasp_pose(
+        # Compute final pre-grasp pose using selected approach
+        final_target_pose = compute_angled_pregrasp_pose(
             object_pose=obj_pose,
             approach_direction=approach_dir,
             gripper_orientation=gripper_ori,
@@ -167,8 +183,33 @@ class ApproachSkill(Skill):
         world_state.approach_direction = approach_dir
         world_state.gripper_orientation = gripper_ori
 
+        # Generate collision-aware waypoints for constrained locations
+        use_waypoints = in_drawer or on_cabinet or on_elevated
+        waypoints = []
+        if use_waypoints and current_pose is not None:
+            waypoint_positions = generate_collision_aware_path(
+                start_pos=current_pose[:3],
+                target_pos=final_target_pose[:3],
+                in_drawer=in_drawer,
+                on_cabinet=on_cabinet,
+                on_elevated=on_elevated,
+            )
+            # Convert position waypoints to full 7D poses
+            for wp_pos in waypoint_positions[:-1]:  # Exclude final (that's target)
+                wp_pose = np.zeros(7)
+                wp_pose[:3] = wp_pos
+                wp_pose[3:7] = gripper_ori
+                waypoints.append(wp_pose)
+
+        # Add final target
+        waypoints.append(final_target_pose)
+
+        # Execute waypoint-based motion
+        current_waypoint_idx = 0
+        target_pose = waypoints[current_waypoint_idx]
+
         # NOTE: In robosuite OSC, action[6] = -1.0 opens gripper, +1.0 closes
-        self.controller.set_target(target_pose, gripper=-1.0)  # Open gripper (inverted)
+        self.controller.set_target(target_pose, gripper=-1.0)
 
         for step in range(self.max_steps):
             steps_taken = step + 1
@@ -181,11 +222,34 @@ class ApproachSkill(Skill):
 
             trajectory.append(current_pose[:3].copy())
 
-            # Check if at target with both total and XY thresholds
-            # This prevents declaring success when Z is correct but XY is far off
-            if self._is_at_target(current_pose, target_pose):
-                xy_error = np.linalg.norm(current_pose[:2] - target_pose[:2])
-                z_error = abs(current_pose[2] - target_pose[2])
+            # Check if reached current waypoint
+            if is_waypoint_reached(current_pose[:3], target_pose[:3], threshold=0.04):
+                current_waypoint_idx += 1
+                if current_waypoint_idx >= len(waypoints):
+                    # Reached final target
+                    xy_error = np.linalg.norm(current_pose[:2] - final_target_pose[:2])
+                    z_error = abs(current_pose[2] - final_target_pose[2])
+                    return SkillResult(
+                        success=True,
+                        info={
+                            "steps_taken": steps_taken,
+                            "reached_target": True,
+                            "final_pose": current_pose,
+                            "final_error": self.controller.position_error(current_pose),
+                            "xy_error": xy_error,
+                            "z_error": z_error,
+                            "approach_strategy": strategy_name,
+                            "waypoints_used": len(waypoints),
+                        }
+                    )
+                # Move to next waypoint
+                target_pose = waypoints[current_waypoint_idx]
+                self.controller.set_target(target_pose, gripper=-1.0)
+
+            # Also check final target directly (for non-waypoint paths)
+            if self._is_at_target(current_pose, final_target_pose):
+                xy_error = np.linalg.norm(current_pose[:2] - final_target_pose[:2])
+                z_error = abs(current_pose[2] - final_target_pose[2])
                 return SkillResult(
                     success=True,
                     info={
@@ -196,6 +260,7 @@ class ApproachSkill(Skill):
                         "xy_error": xy_error,
                         "z_error": z_error,
                         "approach_strategy": strategy_name,
+                        "waypoints_used": len(waypoints),
                     }
                 )
 
@@ -205,12 +270,11 @@ class ApproachSkill(Skill):
             action[3:6] = 0.0
             obs, _, _, _ = self._step_env(env, action)
             current_pose = self._get_gripper_pose(env, obs)
-            last_obs = obs
 
-        # Final check after all steps - might have reached target on last step
-        if current_pose is not None and self._is_at_target(current_pose, target_pose):
-            xy_error = np.linalg.norm(current_pose[:2] - target_pose[:2])
-            z_error = abs(current_pose[2] - target_pose[2])
+        # Final check after all steps
+        if current_pose is not None and self._is_at_target(current_pose, final_target_pose):
+            xy_error = np.linalg.norm(current_pose[:2] - final_target_pose[:2])
+            z_error = abs(current_pose[2] - final_target_pose[2])
             return SkillResult(
                 success=True,
                 info={
@@ -220,14 +284,15 @@ class ApproachSkill(Skill):
                     "final_error": self.controller.position_error(current_pose),
                     "xy_error": xy_error,
                     "z_error": z_error,
+                    "waypoints_used": len(waypoints),
                 }
             )
 
-        # Timeout - log XY/Z errors for diagnosis
+        # Timeout - log errors for diagnosis
         final_pose = current_pose
         final_error = self.controller.position_error(final_pose) if final_pose is not None else float('inf')
-        xy_error = np.linalg.norm(final_pose[:2] - target_pose[:2]) if final_pose is not None else float('inf')
-        z_error = abs(final_pose[2] - target_pose[2]) if final_pose is not None else float('inf')
+        xy_error = np.linalg.norm(final_pose[:2] - final_target_pose[:2]) if final_pose is not None else float('inf')
+        z_error = abs(final_pose[2] - final_target_pose[2]) if final_pose is not None else float('inf')
 
         return SkillResult(
             success=False,
@@ -239,6 +304,7 @@ class ApproachSkill(Skill):
                 "final_error": final_error,
                 "xy_error": xy_error,
                 "z_error": z_error,
+                "waypoint_progress": f"{current_waypoint_idx}/{len(waypoints)}",
             }
         )
     

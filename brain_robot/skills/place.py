@@ -255,13 +255,17 @@ class PlaceSkill(Skill):
                     current_pose = self._get_gripper_pose(env, obs)
                     last_obs = obs
 
-        # Phase 0: XY Centering with GRASP OFFSET COMPENSATION
+        # Phase 0: TWO-PASS XY Centering with GRASP OFFSET COMPENSATION
         # Critical for LIBERO success which requires <3cm XY precision
         #
         # KEY INSIGHT: For rim grasps, bowl_center != gripper_center
         # grasp_offset_xy = bowl_center - gripper_center (computed during grasp)
         # To place bowl_center over plate_center:
         #   desired_gripper_pos = plate_center - grasp_offset_xy
+        #
+        # TWO-PASS APPROACH:
+        # Pass 1 (Coarse): Fast convergence to 5cm threshold
+        # Pass 2 (Fine): Slower, precise convergence to 1cm threshold
         #
         # We also use real-time tracking since the plate may move
 
@@ -271,14 +275,23 @@ class PlaceSkill(Skill):
             grasp_offset = np.zeros(2)
         grasp_offset = np.array(grasp_offset)
 
+        # Two-pass centering thresholds
+        COARSE_THRESHOLD = 0.05  # 5cm for first pass
+        FINE_THRESHOLD = 0.01   # 1cm for second pass (LIBERO requires <3cm)
+
         if target_pos is not None:
             # Compute where gripper should be so that OBJECT center is over target
             # gripper_target = plate_center - offset
             gripper_target_xy = target_pos[:2] - grasp_offset
             xy_error_before = np.linalg.norm(current_pose[:2] - gripper_target_xy)
 
-            if xy_error_before > 0.015:  # Only if needed (>1.5cm error)
-                for step in range(xy_center_steps):
+            # Allocate steps between passes
+            coarse_steps = xy_center_steps // 2
+            fine_steps = xy_center_steps - coarse_steps
+
+            # PASS 1: Coarse centering (fast, threshold=5cm)
+            if xy_error_before > COARSE_THRESHOLD:
+                for step in range(coarse_steps):
                     steps_taken += 1
                     if current_pose is None:
                         break
@@ -287,23 +300,59 @@ class PlaceSkill(Skill):
                     live_target = self._get_live_target_position(env, target)
                     if live_target is not None:
                         target_pos = live_target
-                        # Recompute gripper target with updated plate position
                         gripper_target_xy = target_pos[:2] - grasp_offset
 
                     xy_error = np.linalg.norm(current_pose[:2] - gripper_target_xy)
-                    if xy_error < 0.015:  # 1.5cm threshold - tight for LIBERO
+                    if xy_error < COARSE_THRESHOLD:
                         break
 
                     # Update controller target - move gripper to offset position
                     center_target = current_pose.copy()
                     center_target[0] = gripper_target_xy[0]
                     center_target[1] = gripper_target_xy[1]
-                    # Keep current Z height during centering
-                    self.controller.set_target(center_target, gripper=1.0)  # Keep closed
+                    self.controller.set_target(center_target, gripper=1.0)
 
                     action = self.controller.compute_action(current_pose)
-                    # Zero out orientation control during lateral movement
-                    action[3:6] = 0.0
+                    action[3:6] = 0.0  # Zero out orientation control
+                    obs, _, _, _ = self._step_env(env, action)
+                    current_pose = self._get_gripper_pose(env, obs)
+                    last_obs = obs
+
+            # PASS 2: Fine centering (slower, threshold=1cm)
+            # Update target position after coarse pass
+            live_target = self._get_live_target_position(env, target)
+            if live_target is not None:
+                target_pos = live_target
+                gripper_target_xy = target_pos[:2] - grasp_offset
+
+            xy_error_after_coarse = np.linalg.norm(current_pose[:2] - gripper_target_xy) if current_pose is not None else xy_error_before
+
+            if xy_error_after_coarse > FINE_THRESHOLD:
+                for step in range(fine_steps):
+                    steps_taken += 1
+                    if current_pose is None:
+                        break
+
+                    # Real-time tracking every step for fine centering
+                    live_target = self._get_live_target_position(env, target)
+                    if live_target is not None:
+                        target_pos = live_target
+                        gripper_target_xy = target_pos[:2] - grasp_offset
+
+                    xy_error = np.linalg.norm(current_pose[:2] - gripper_target_xy)
+                    if xy_error < FINE_THRESHOLD:
+                        break
+
+                    # Fine centering with smaller movements
+                    center_target = current_pose.copy()
+                    center_target[0] = gripper_target_xy[0]
+                    center_target[1] = gripper_target_xy[1]
+                    self.controller.set_target(center_target, gripper=1.0)
+
+                    action = self.controller.compute_action(current_pose)
+                    action[3:6] = 0.0  # Zero out orientation control
+                    # Scale down action magnitude for finer control
+                    action[:3] = action[:3] * 0.7
                     obs, _, _, _ = self._step_env(env, action)
                     current_pose = self._get_gripper_pose(env, obs)
                     last_obs = obs

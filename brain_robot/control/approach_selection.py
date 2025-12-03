@@ -46,6 +46,7 @@ def select_approach_strategy(
     obj_height: float = 0.0,
     in_drawer: bool = False,
     on_elevated_surface: bool = False,
+    on_cabinet: bool = False,
 ) -> Tuple[str, np.ndarray, np.ndarray]:
     """Select optimal approach direction based on object position.
 
@@ -55,6 +56,7 @@ def select_approach_strategy(
         obj_height: Height of object above table (for elevated objects)
         in_drawer: Whether object is inside a drawer
         on_elevated_surface: Whether object is on elevated surface (cabinet, stove)
+        on_cabinet: Whether object is on top of a cabinet (requires special approach)
 
     Returns:
         Tuple of (strategy_name, approach_direction, gripper_orientation)
@@ -73,13 +75,20 @@ def select_approach_strategy(
                 APPROACH_DIRECTIONS["front_horizontal"],
                 APPROACH_ORIENTATIONS["front_horizontal"])
 
-    # Case 2: Object on elevated surface (cabinet top, stove) - front angled
-    if on_elevated_surface or obj_z > 1.1:
+    # Case 2: Object on cabinet top (highest priority for elevated surfaces)
+    # Cabinet tops are far from robot and high up - need steep angled approach
+    if on_cabinet or obj_z > 1.2:
+        return ("front_angled_steep",
+                APPROACH_DIRECTIONS["front_angled_steep"],
+                APPROACH_ORIENTATIONS["front_angled_steep"])
+
+    # Case 3: Object on elevated surface (stove, cookie box) - front angled
+    if on_elevated_surface or obj_z > 1.05:
         return ("front_angled",
                 APPROACH_DIRECTIONS["front_angled"],
                 APPROACH_ORIENTATIONS["front_angled"])
 
-    # Case 3: Object behind robot (negative Y) - front angled approach
+    # Case 4: Object behind robot (negative Y) - front angled approach
     # This includes objects near Y=0 which are still hard to reach top-down
     if rel_y < 0.05:  # Behind or at center line
         # Use steeper angle for objects further back

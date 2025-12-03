@@ -8,6 +8,7 @@ from .skill_schema import SKILL_SCHEMA, get_skill_by_name
 from .plan_validator import validate_plan, parse_qwen_output
 from .skill_planner import QwenSkillPlanner
 from .planner_metrics import PlannerMetrics
+from .skill_chain import SkillChain, SkillStep, ChainResult
 
 __all__ = [
     "SKILL_SCHEMA",
@@ -16,4 +17,7 @@ __all__ = [
     "parse_qwen_output",
     "QwenSkillPlanner",
     "PlannerMetrics",
+    "SkillChain",
+    "SkillStep",
+    "ChainResult",
 ]

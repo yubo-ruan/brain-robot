@@ -106,7 +106,8 @@ class TurnOnStoveSkill(Skill):
 
         approach_target = current_pose.copy()
         approach_target[:3] = approach_pos
-        self.controller.set_target(approach_target, gripper=-1.0)  # Closed for pressing
+        # NOTE: In robosuite OSC, action[6] = +1.0 closes gripper, -1.0 opens
+        self.controller.set_target(approach_target, gripper=1.0)  # Closed for pressing
 
         for step in range(self.max_steps // 3):
             steps_taken += 1
@@ -126,7 +127,7 @@ class TurnOnStoveSkill(Skill):
             press_target[:3] = button_pos
             press_target[2] += 0.02  # Slightly above button surface
 
-            self.controller.set_target(press_target, gripper=-1.0)
+            self.controller.set_target(press_target, gripper=1.0)  # Closed for pressing
 
             for step in range(self.max_steps // 3):
                 steps_taken += 1
@@ -145,7 +146,7 @@ class TurnOnStoveSkill(Skill):
             press_target = current_pose.copy()
             press_target[2] -= self.press_depth
 
-            self.controller.set_target(press_target, gripper=-1.0)
+            self.controller.set_target(press_target, gripper=1.0)  # Keep closed
 
             for step in range(30):
                 steps_taken += 1
@@ -161,7 +162,7 @@ class TurnOnStoveSkill(Skill):
             release_target = current_pose.copy()
             release_target[2] += 0.05
 
-            self.controller.set_target(release_target, gripper=-1.0)
+            self.controller.set_target(release_target, gripper=1.0)  # Keep closed during retreat
 
             for step in range(30):
                 steps_taken += 1
