@@ -271,6 +271,7 @@ class GraspSkill(Skill):
         descent_start_z = current_pose[2] if current_pose is not None else 0.0
         descent_converged = False
         visual_servo_corrections = 0
+        missing_live_pose_count = 0  # Track when we can't get live object position
 
         for step in range(descent_steps):
             steps_taken += 1
@@ -292,6 +293,7 @@ class GraspSkill(Skill):
                     grasp_target[:2] = live_obj_pos[:2] + grasp_offset[:2]
                     self.controller.set_target(grasp_target, gripper=gripper_action)
                     visual_servo_corrections += 1
+                    missing_live_pose_count = 0
 
                 # Heuristic grasps: full recompute with rim logic
                 elif live_obj_pos is not None:
@@ -303,9 +305,11 @@ class GraspSkill(Skill):
                     grasp_target[:3] = new_grasp_xyz
                     self.controller.set_target(grasp_target, gripper=gripper_action)
                     visual_servo_corrections += 1
+                    missing_live_pose_count = 0
 
-                # Fallback: no live pose available, keep previous target
-                # (don't update controller, just continue with last known target)
+                else:
+                    # No live pose available - keep previous target, track for debugging
+                    missing_live_pose_count += 1
 
             # Check convergence with tight threshold for precise grasping
             pos_error = np.linalg.norm(current_pose[:3] - grasp_target[:3])
@@ -343,6 +347,7 @@ class GraspSkill(Skill):
             "start_x": grasp_target[0] if current_pose is not None else 0.0,
             "start_y": grasp_target[1] if current_pose is not None else 0.0,
             "visual_servo_corrections": visual_servo_corrections,
+            "missing_live_pose_count": missing_live_pose_count,
             "approach_strategy": approach_strategy,
             # CGN-specific logging
             "using_learned_grasp": using_learned_grasp,
@@ -404,11 +409,20 @@ class GraspSkill(Skill):
                     prev_qpos = current_qpos
 
         # Record close phase info
+        final_qpos_raw = None
+        if last_obs and 'robot0_gripper_qpos' in last_obs:
+            final_qpos_raw = last_obs['robot0_gripper_qpos'].tolist()
+
         close_info = {
             "stop_reason": close_stop_reason,
             "target_qpos": target_qpos,
             "final_qpos": prev_qpos if prev_qpos is not None else -1,
+            "final_qpos_raw": final_qpos_raw,  # Raw qpos vector for analysis
             "steps": step + 1 if 'step' in dir() else close_steps,
+            # Include grasp metadata for analysis
+            "using_learned_grasp": using_learned_grasp,
+            "grasp_width": float(grasp_width),
+            "grasp_strategy": grasp_strategy,
         }
 
         # Phase 3: Lift
