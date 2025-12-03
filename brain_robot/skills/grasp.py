@@ -285,8 +285,11 @@ class GraspSkill(Skill):
 
                 # Learned grasps: apply fixed offset, skip heuristic rim logic entirely
                 if using_learned_grasp and live_obj_pos is not None:
+                    # NOTE: We only servo XY, not Z. This assumes object height is
+                    # constant on the table in LIBERO. If tasks involve vertical
+                    # motion (stacked objects, non-table surfaces), change to:
+                    # grasp_target[:3] = live_obj_pos + grasp_offset
                     grasp_target[:2] = live_obj_pos[:2] + grasp_offset[:2]
-                    # Keep Z and orientation from CGN/GIGA prediction
                     self.controller.set_target(grasp_target, gripper=gripper_action)
                     visual_servo_corrections += 1
 
@@ -300,6 +303,9 @@ class GraspSkill(Skill):
                     grasp_target[:3] = new_grasp_xyz
                     self.controller.set_target(grasp_target, gripper=gripper_action)
                     visual_servo_corrections += 1
+
+                # Fallback: no live pose available, keep previous target
+                # (don't update controller, just continue with last known target)
 
             # Check convergence with tight threshold for precise grasping
             pos_error = np.linalg.norm(current_pose[:3] - grasp_target[:3])
@@ -363,6 +369,8 @@ class GraspSkill(Skill):
         prev_qpos = None
         stall_count = 0
         gripper_close_action = 1.0  # Always command close
+        close_stop_reason = "timeout"  # Default if loop completes
+        stall_eps = 0.001  # Threshold for detecting gripper stall
 
         for step in range(close_steps):
             steps_taken += 1
@@ -379,18 +387,29 @@ class GraspSkill(Skill):
                     current_qpos = np.sum(np.abs(obs['robot0_gripper_qpos']))
 
                     # Stop if reached target width
+                    # In robosuite: smaller qpos = more closed
                     if current_qpos <= target_qpos:
+                        close_stop_reason = "width"
                         break
 
                     # Stop if gripper stalled (contact detected)
                     if prev_qpos is not None:
-                        if abs(current_qpos - prev_qpos) < 0.001:
+                        if abs(current_qpos - prev_qpos) < stall_eps:
                             stall_count += 1
                             if stall_count >= 3:
+                                close_stop_reason = "stall"
                                 break
                         else:
                             stall_count = 0
                     prev_qpos = current_qpos
+
+        # Record close phase info
+        close_info = {
+            "stop_reason": close_stop_reason,
+            "target_qpos": target_qpos,
+            "final_qpos": prev_qpos if prev_qpos is not None else -1,
+            "steps": step + 1 if 'step' in dir() else close_steps,
+        }
 
         # Phase 3: Lift
         current_pose = self._get_gripper_pose(env, last_obs)
@@ -435,6 +454,7 @@ class GraspSkill(Skill):
             "xy_refinement": xy_refine_info,
             "grasp_point_info": grasp_point_info,
             "descent_info": descent_info,
+            "close_info": close_info,  # Width-based close diagnostics
             "gripper_closed": gripper_closed,
             "gripper_width": gripper_width,
             "object_lifted": object_lifted,
