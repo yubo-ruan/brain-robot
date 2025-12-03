@@ -279,30 +279,25 @@ class GraspSkill(Skill):
 
             # VISUAL SERVO: Check gripper-to-object error periodically
             # Update target if object moved or gripper drifted significantly
-            # Tighter interval (5 steps) for better tracking of bowl movement
             servo_interval = 5
             if step > 0 and step % servo_interval == 0:
                 live_obj_pos = self._get_live_object_position(env, obj_name)
-                if live_obj_pos is not None:
-                    if using_learned_grasp:
-                        # For learned grasps (CGN/GIGA): use pre-computed offset
-                        # Apply offset to current object position to get new grasp target
-                        # This avoids accumulation bugs from adding delta each time
-                        grasp_target[0] = live_obj_pos[0] + grasp_offset[0]
-                        grasp_target[1] = live_obj_pos[1] + grasp_offset[1]
-                        # Keep Z from original prediction (don't servo in Z)
-                        # Keep orientation from CGN fixed
-                    else:
-                        # For heuristic grasps: full recompute with rim logic
-                        updated_obj_pose = obj_pose.copy()
-                        updated_obj_pose[:3] = live_obj_pos
-                        new_grasp_xyz, _ = self._compute_grasp_point(
-                            updated_obj_pose, obj_name, world_state, current_pose
-                        )
-                        grasp_target[0] = new_grasp_xyz[0]
-                        grasp_target[1] = new_grasp_xyz[1]
-                        grasp_target[2] = new_grasp_xyz[2]
 
+                # Learned grasps: apply fixed offset, skip heuristic rim logic entirely
+                if using_learned_grasp and live_obj_pos is not None:
+                    grasp_target[:2] = live_obj_pos[:2] + grasp_offset[:2]
+                    # Keep Z and orientation from CGN/GIGA prediction
+                    self.controller.set_target(grasp_target, gripper=gripper_action)
+                    visual_servo_corrections += 1
+
+                # Heuristic grasps: full recompute with rim logic
+                elif live_obj_pos is not None:
+                    updated_obj_pose = obj_pose.copy()
+                    updated_obj_pose[:3] = live_obj_pos
+                    new_grasp_xyz, _ = self._compute_grasp_point(
+                        updated_obj_pose, obj_name, world_state, current_pose
+                    )
+                    grasp_target[:3] = new_grasp_xyz
                     self.controller.set_target(grasp_target, gripper=gripper_action)
                     visual_servo_corrections += 1
 
@@ -351,24 +346,23 @@ class GraspSkill(Skill):
             "grasp_offset": grasp_offset.tolist(),  # Fixed offset for visual servo
         }
 
-        # Phase 2: Close gripper (20 steps is enough)
+        # Phase 2: Close gripper with width-based stop condition
         # NOTE: In robosuite OSC, action[6] = +1.0 closes gripper
         close_steps = 20
 
-        # Compute target gripper action based on predicted width
-        # Robosuite gripper: -1.0 = fully open (~0.08m), +1.0 = fully closed (~0.0m)
-        # Use predicted width to avoid crushing delicate objects
+        # For learned grasps: use predicted width as stop condition
+        # For heuristic grasps: close fully (action=+1.0)
         if grasp_width > 0 and using_learned_grasp:
-            # Map gripper_width (meters) to action space
-            # Linear mapping: 0.0m -> 1.0 (closed), 0.08m -> -1.0 (open)
-            # action = 1.0 - (width / 0.08) * 2.0
-            # But we want to close ONTO the object, so use slightly tighter
-            target_width = grasp_width * 0.9  # 10% tighter than predicted
-            gripper_close_action = 1.0 - (target_width / 0.08) * 2.0
-            gripper_close_action = np.clip(gripper_close_action, -1.0, 1.0)
+            # Target qpos based on predicted width
+            # Empirical mapping: gripper_qpos_sum ≈ width (in meters)
+            # Add 10% margin to ensure firm grasp
+            target_qpos = grasp_width * 0.9
         else:
-            # Default: fully close (heuristic grasps)
-            gripper_close_action = 1.0
+            target_qpos = 0.0  # Fully closed
+
+        prev_qpos = None
+        stall_count = 0
+        gripper_close_action = 1.0  # Always command close
 
         for step in range(close_steps):
             steps_taken += 1
@@ -378,6 +372,25 @@ class GraspSkill(Skill):
             action[6] = gripper_close_action
             obs, _, _, _ = self._step_env(env, action)
             last_obs = obs
+
+            # Check stop conditions for learned grasps
+            if using_learned_grasp and grasp_width > 0:
+                if 'robot0_gripper_qpos' in obs:
+                    current_qpos = np.sum(np.abs(obs['robot0_gripper_qpos']))
+
+                    # Stop if reached target width
+                    if current_qpos <= target_qpos:
+                        break
+
+                    # Stop if gripper stalled (contact detected)
+                    if prev_qpos is not None:
+                        if abs(current_qpos - prev_qpos) < 0.001:
+                            stall_count += 1
+                            if stall_count >= 3:
+                                break
+                        else:
+                            stall_count = 0
+                    prev_qpos = current_qpos
 
         # Phase 3: Lift
         current_pose = self._get_gripper_pose(env, last_obs)
