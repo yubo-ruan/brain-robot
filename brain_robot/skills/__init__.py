@@ -15,6 +15,7 @@ from .grasp_selection import (
     GraspPose,
     HeuristicGraspSelector,
     GIGAGraspSelector,
+    ContactGraspNetSelector,
     get_grasp_selector,
     register_grasp_selector,
 )
@@ -37,6 +38,7 @@ __all__ = [
     "GraspPose",
     "HeuristicGraspSelector",
     "GIGAGraspSelector",
+    "ContactGraspNetSelector",
     "get_grasp_selector",
     "register_grasp_selector",
 ]

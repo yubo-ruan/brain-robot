@@ -8,7 +8,7 @@ from typing import Dict, Any, Tuple, Optional
 import numpy as np
 
 from .base import Skill, SkillResult
-from .grasp_selection import GraspSelector, HeuristicGraspSelector, get_grasp_selector
+from .grasp_selection import GraspSelector, get_grasp_selector
 from ..world_model.state import WorldState
 from ..control.cartesian_pd import CartesianPDController
 from ..config import SkillConfig
@@ -57,6 +57,9 @@ class GraspSkill(Skill):
 
     # Workspace limits - gripper can't reach certain regions without fighting
     MIN_WORKSPACE_Y = 0.12  # Don't go below Y=0.12m for top-down approaches
+
+    # Default gripper-down orientation quaternion [w, x, y, z]
+    DEFAULT_ORIENTATION = np.array([-0.02, 0.707, 0.707, -0.02])
 
     def __init__(
         self,
@@ -186,6 +189,11 @@ class GraspSkill(Skill):
         steps_taken = 0
         xy_refine_info = {}
 
+        # Initialize grasp strategy early to avoid undefined in edge cases
+        grasp_strategy = "heuristic"  # Default fallback
+        using_learned_grasp = False
+        grasp_width = 0.0  # Default gripper width
+
         # Phase 0: Ensure gripper is fully open while holding position
         # NOTE: In robosuite OSC, action[6] = -1.0 opens gripper, +1.0 closes
         # We use the PD controller to hold current position while opening
@@ -197,11 +205,16 @@ class GraspSkill(Skill):
             current_pose = self._get_gripper_pose(env, obs)
             last_obs = obs
 
-        # Compute grasp point BEFORE XY refinement (so rim offset uses approach direction)
-        # For hollow objects, this computes offset toward gripper's current position (rim)
-        grasp_xyz, grasp_point_info = self._compute_grasp_point(
+        # Compute full 6-DoF grasp pose BEFORE XY refinement
+        # For learned selectors (CGN), this gives us position + orientation + width
+        # For heuristic, gives position with default orientation
+        grasp_xyz, grasp_orientation, grasp_width, grasp_point_info = self._compute_grasp_pose(
             obj_pose, obj_name, world_state, current_pose
         )
+
+        # Determine if we're using a learned grasp (affects servo behavior)
+        using_learned_grasp = grasp_point_info.get("learned_grasp", False)
+        grasp_strategy = grasp_point_info.get("grasp_strategy_used", "heuristic")
 
         # Phase 0.5: XY Refinement - target the grasp point, not object center!
         if self.xy_refine_enabled:
@@ -218,20 +231,38 @@ class GraspSkill(Skill):
             last_obs = xy_refine_info.get("last_obs", last_obs)
 
         # Phase 1: Descend to grasp point
-        # Get approach strategy from world state (set by ApproachSkill)
-        approach_strategy = getattr(world_state, 'approach_strategy', 'top_down')
+        # Get approach strategy - use learned grasp strategy if available
+        if using_learned_grasp:
+            approach_strategy = grasp_strategy  # "contact_graspnet" or "giga"
+        else:
+            approach_strategy = getattr(world_state, 'approach_strategy', 'top_down')
 
         # Need to refresh current_pose from the environment
         obs, _, _, _ = self._step_env(env, np.zeros(7))
         current_pose = self._get_gripper_pose(env, obs)
         last_obs = obs
 
+        # Build full 6-DoF grasp target
         grasp_target = current_pose.copy()
         grasp_target[0] = grasp_xyz[0]
         grasp_target[1] = grasp_xyz[1]
         grasp_target[2] = grasp_xyz[2]
 
-        self.controller.set_target(grasp_target, gripper=-1.0)  # Keep gripper open (inverted)
+        # For learned grasps, use predicted orientation
+        # For heuristic grasps, keep current orientation (gripper-down)
+        if using_learned_grasp and grasp_orientation is not None:
+            grasp_target[3:7] = grasp_orientation
+
+        # Compute grasp offset from object center ONCE for visual servo
+        # This is the fixed offset between object center and grasp point
+        # During servo, we apply: grasp_target = live_obj_pos + grasp_offset
+        grasp_offset = grasp_xyz - obj_pose[:3]  # [x_off, y_off, z_off]
+
+        # Gripper starts fully open during descent
+        # Robosuite: -1.0 = fully open (~0.08m), +1.0 = fully closed (~0.0m)
+        gripper_action = -1.0
+
+        self.controller.set_target(grasp_target, gripper=gripper_action)
 
         # Use more steps for descent (50% of budget for this critical phase)
         descent_steps = self.max_steps // 2
@@ -253,17 +284,26 @@ class GraspSkill(Skill):
             if step > 0 and step % servo_interval == 0:
                 live_obj_pos = self._get_live_object_position(env, obj_name)
                 if live_obj_pos is not None:
-                    # Recompute grasp point based on current object position
-                    updated_obj_pose = obj_pose.copy()
-                    updated_obj_pose[:3] = live_obj_pos
-                    new_grasp_xyz, _ = self._compute_grasp_point(
-                        updated_obj_pose, obj_name, world_state, current_pose
-                    )
-                    # Always update target to latest grasp point
-                    grasp_target[0] = new_grasp_xyz[0]
-                    grasp_target[1] = new_grasp_xyz[1]
-                    grasp_target[2] = new_grasp_xyz[2]
-                    self.controller.set_target(grasp_target, gripper=-1.0)
+                    if using_learned_grasp:
+                        # For learned grasps (CGN/GIGA): use pre-computed offset
+                        # Apply offset to current object position to get new grasp target
+                        # This avoids accumulation bugs from adding delta each time
+                        grasp_target[0] = live_obj_pos[0] + grasp_offset[0]
+                        grasp_target[1] = live_obj_pos[1] + grasp_offset[1]
+                        # Keep Z from original prediction (don't servo in Z)
+                        # Keep orientation from CGN fixed
+                    else:
+                        # For heuristic grasps: full recompute with rim logic
+                        updated_obj_pose = obj_pose.copy()
+                        updated_obj_pose[:3] = live_obj_pos
+                        new_grasp_xyz, _ = self._compute_grasp_point(
+                            updated_obj_pose, obj_name, world_state, current_pose
+                        )
+                        grasp_target[0] = new_grasp_xyz[0]
+                        grasp_target[1] = new_grasp_xyz[1]
+                        grasp_target[2] = new_grasp_xyz[2]
+
+                    self.controller.set_target(grasp_target, gripper=gripper_action)
                     visual_servo_corrections += 1
 
             # Check convergence with tight threshold for precise grasping
@@ -273,12 +313,16 @@ class GraspSkill(Skill):
                 break
 
             action = self.controller.compute_action(current_pose)
-            # For angled approaches, allow some orientation control to maintain gripper angle
-            # For top-down, zero out orientation to avoid fighting position control
-            if approach_strategy == 'top_down':
+            # Orientation control strategy depends on grasp type
+            if using_learned_grasp:
+                # For learned grasps (CGN/GIGA): use full orientation control
+                # CGN gives us the target orientation, let controller track it
+                action[3:6] *= 0.5  # Moderate gain to avoid oscillation
+            elif approach_strategy == 'top_down':
+                # For top-down heuristic: zero orientation to avoid fighting
                 action[3:6] = 0.0
             else:
-                # Reduce but don't zero orientation control for angled grasps
+                # For angled heuristic approaches: reduced orientation control
                 action[3:6] *= 0.3
             obs, _, _, _ = self._step_env(env, action)
             current_pose = self._get_gripper_pose(env, obs)
@@ -299,17 +343,39 @@ class GraspSkill(Skill):
             "start_y": grasp_target[1] if current_pose is not None else 0.0,
             "visual_servo_corrections": visual_servo_corrections,
             "approach_strategy": approach_strategy,
+            # CGN-specific logging
+            "using_learned_grasp": using_learned_grasp,
+            "grasp_strategy": grasp_strategy,
+            "predicted_gripper_width": grasp_width,
+            "target_orientation": grasp_orientation.tolist() if grasp_orientation is not None else None,
+            "grasp_offset": grasp_offset.tolist(),  # Fixed offset for visual servo
         }
 
         # Phase 2: Close gripper (20 steps is enough)
         # NOTE: In robosuite OSC, action[6] = +1.0 closes gripper
         close_steps = 20
+
+        # Compute target gripper action based on predicted width
+        # Robosuite gripper: -1.0 = fully open (~0.08m), +1.0 = fully closed (~0.0m)
+        # Use predicted width to avoid crushing delicate objects
+        if grasp_width > 0 and using_learned_grasp:
+            # Map gripper_width (meters) to action space
+            # Linear mapping: 0.0m -> 1.0 (closed), 0.08m -> -1.0 (open)
+            # action = 1.0 - (width / 0.08) * 2.0
+            # But we want to close ONTO the object, so use slightly tighter
+            target_width = grasp_width * 0.9  # 10% tighter than predicted
+            gripper_close_action = 1.0 - (target_width / 0.08) * 2.0
+            gripper_close_action = np.clip(gripper_close_action, -1.0, 1.0)
+        else:
+            # Default: fully close (heuristic grasps)
+            gripper_close_action = 1.0
+
         for step in range(close_steps):
             steps_taken += 1
 
             # Close gripper action
             action = np.zeros(7)
-            action[6] = 1.0  # Close gripper (inverted in robosuite)
+            action[6] = gripper_close_action
             obs, _, _, _ = self._step_env(env, action)
             last_obs = obs
 
@@ -318,7 +384,8 @@ class GraspSkill(Skill):
         if current_pose is not None:
             lift_target = current_pose.copy()
             lift_target[2] += self.lift_height
-            self.controller.set_target(lift_target, gripper=1.0)  # Keep closed (inverted)
+            # Keep gripper at same closing level during lift
+            self.controller.set_target(lift_target, gripper=gripper_close_action)
 
             lift_steps = 30
             for step in range(lift_steps):
@@ -585,29 +652,36 @@ class GraspSkill(Skill):
         except Exception:
             return None
 
-    def _compute_grasp_point(
+    def _compute_grasp_pose(
         self,
         obj_pose: np.ndarray,
         obj_name: str,
         world_state: WorldState,
         gripper_pose: np.ndarray,
-    ) -> Tuple[np.ndarray, Dict[str, Any]]:
-        """Compute optimal grasp point using the configured GraspSelector.
+        point_cloud: Optional[np.ndarray] = None,
+        depth_image: Optional[np.ndarray] = None,
+        camera_intrinsics: Optional[np.ndarray] = None,
+    ) -> Tuple[np.ndarray, np.ndarray, float, Dict[str, Any]]:
+        """Compute optimal 6-DoF grasp pose using the configured GraspSelector.
 
-        For hollow objects (bowls, mugs), offsets toward the rim.
-        For solid objects, targets the center.
-
-        This method now delegates to self.grasp_selector for the actual
-        grasp point computation, allowing swappable strategies (heuristic, GIGA, etc.)
+        For learned selectors (Contact-GraspNet), returns full 6-DoF pose.
+        For heuristic selectors, returns position with default orientation.
 
         Args:
             obj_pose: Object pose [x, y, z, qw, qx, qy, qz]
             obj_name: Object name for lookup
             world_state: World state with object metadata
             gripper_pose: Current gripper pose (used to determine offset direction)
+            point_cloud: Optional point cloud (N, 3) for learned selectors
+            depth_image: Optional depth image for point cloud generation
+            camera_intrinsics: Optional camera K matrix (3x3)
 
         Returns:
-            Tuple of (grasp_target_xyz, info_dict)
+            Tuple of (position, orientation, gripper_width, info_dict):
+            - position: (3,) grasp position [x, y, z]
+            - orientation: (4,) quaternion [qw, qx, qy, qz]
+            - gripper_width: predicted gripper width (meters)
+            - info: dict with grasp metadata
         """
         # Get object type from world state
         obj_type = None
@@ -632,10 +706,68 @@ class GraspSkill(Skill):
             obj_type=obj_type,
             gripper_pose=gripper_pose,
             approach_strategy=approach_strategy,
+            point_cloud=point_cloud,
+            depth_image=depth_image,
+            camera_intrinsics=camera_intrinsics,
         )
 
-        # Return position as numpy array (selector returns GraspPose object)
-        return grasp_pose.position.copy(), info
+        # Extract position
+        position = grasp_pose.position.copy()
+
+        # Extract orientation (quaternion [w, x, y, z])
+        if grasp_pose.orientation is not None and len(grasp_pose.orientation) == 4:
+            orientation = grasp_pose.orientation.copy()
+        else:
+            # Fallback to default gripper-down orientation
+            orientation = self.DEFAULT_ORIENTATION.copy()
+
+        # Extract gripper width
+        gripper_width = grasp_pose.gripper_width
+
+        # Add grasp strategy info
+        info["grasp_strategy_used"] = grasp_pose.strategy
+        info["grasp_confidence"] = grasp_pose.confidence
+
+        # If using learned selector (not heuristic), update approach strategy
+        if grasp_pose.strategy in ("contact_graspnet", "giga"):
+            # Compute approach direction from grasp pose
+            if grasp_pose.approach_direction is not None:
+                info["approach_direction"] = grasp_pose.approach_direction.tolist()
+            # Mark that we're using learned grasp - affects servo behavior
+            info["learned_grasp"] = True
+        else:
+            info["learned_grasp"] = False
+
+        return position, orientation, gripper_width, info
+
+    def _compute_grasp_point(
+        self,
+        obj_pose: np.ndarray,
+        obj_name: str,
+        world_state: WorldState,
+        gripper_pose: np.ndarray,
+    ) -> Tuple[np.ndarray, Dict[str, Any]]:
+        """Compute optimal grasp point (legacy interface).
+
+        This is a compatibility wrapper around _compute_grasp_pose that
+        returns only position for backward compatibility.
+
+        Args:
+            obj_pose: Object pose [x, y, z, qw, qx, qy, qz]
+            obj_name: Object name for lookup
+            world_state: World state with object metadata
+            gripper_pose: Current gripper pose
+
+        Returns:
+            Tuple of (grasp_target_xyz, info_dict)
+        """
+        position, orientation, gripper_width, info = self._compute_grasp_pose(
+            obj_pose, obj_name, world_state, gripper_pose
+        )
+        # Store orientation and width in info for callers that want them
+        info["grasp_orientation"] = orientation.tolist()
+        info["grasp_gripper_width"] = gripper_width
+        return position, info
 
     def update_world_state(
         self,

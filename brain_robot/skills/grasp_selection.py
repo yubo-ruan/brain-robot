@@ -2,7 +2,8 @@
 
 Provides pluggable grasp selection strategies:
 - HeuristicGraspSelector: Rule-based (rim grasps for hollow objects, center for solid)
-- GIGAGraspSelector: 6-DoF grasp affordance model integration
+- GIGAGraspSelector: 6-DoF grasp affordance model integration (TSDF input)
+- ContactGraspNetSelector: 6-DoF Contact-GraspNet (point cloud input)
 
 Usage:
     from brain_robot.skills.grasp_selection import get_grasp_selector
@@ -12,6 +13,9 @@ Usage:
 
     # Use GIGA selector (requires GIGA model)
     selector = get_grasp_selector("giga", model_path="path/to/giga.pth")
+
+    # Use Contact-GraspNet selector (requires contact_graspnet_pytorch)
+    selector = get_grasp_selector("contact_graspnet")
 """
 
 from abc import ABC, abstractmethod
@@ -492,10 +496,373 @@ class GIGAGraspSelector(GraspSelector):
         return grasp, info
 
 
+class ContactGraspNetSelector(GraspSelector):
+    """Contact-GraspNet 6-DoF grasp selector.
+
+    Uses the Contact-GraspNet model for dense 6-DoF grasp prediction from
+    point clouds. Falls back to heuristic grasp selection if the model
+    is not available.
+
+    Paper: "Contact-GraspNet: Efficient 6-DoF Grasp Generation in Cluttered Scenes"
+    https://github.com/NVlabs/contact_graspnet
+
+    Input: Point cloud (N, 3) in world frame
+    Output: 6-DoF grasp poses (position + rotation) with confidence scores
+
+    Note: Requires contact_graspnet_pytorch package to be installed.
+    Install from: https://github.com/elchun/contact_graspnet_pytorch
+    """
+
+    # LIBERO table height is approximately 0.8m
+    # Objects typically sit 0.82-0.95m above ground
+    DEFAULT_Z_RANGE = (0.75, 1.2)  # Covers table surface to raised objects
+
+    def __init__(
+        self,
+        model_path: Optional[str] = None,
+        checkpoint_dir: Optional[str] = None,
+        device: str = "cuda",
+        forward_passes: int = 1,
+        z_range: Optional[Tuple[float, float]] = None,
+        score_threshold: float = 0.5,
+        filter_grasps: bool = True,
+        grasp_height_offset: float = 0.04,
+        **kwargs,
+    ):
+        """Initialize Contact-GraspNet selector.
+
+        Args:
+            model_path: Path to model checkpoint (if None, uses default)
+            checkpoint_dir: Directory containing checkpoints
+            device: Device for inference ("cuda" or "cpu")
+            forward_passes: Number of forward passes for sampling
+            z_range: Z range for filtering point cloud (min, max).
+                     Default: (0.75, 1.2) tuned for LIBERO table (~0.8m).
+            score_threshold: Minimum grasp confidence score
+            filter_grasps: Whether to filter grasps to object surface
+            grasp_height_offset: Ignored (for API compatibility)
+            **kwargs: Additional arguments (ignored)
+        """
+        self.model_path = model_path
+        self.checkpoint_dir = checkpoint_dir
+        self.device = device
+        self.forward_passes = forward_passes
+        self.z_range = z_range if z_range is not None else self.DEFAULT_Z_RANGE
+        self.score_threshold = score_threshold
+        self.filter_grasps = filter_grasps
+
+        self.model = None
+        self.grasp_estimator = None
+        self._model_loaded = False
+        self._load_error = None
+
+        # Attempt to load model
+        self._try_load_model()
+
+    def _try_load_model(self):
+        """Attempt to load Contact-GraspNet model."""
+        try:
+            # Try importing the PyTorch implementation
+            from contact_graspnet_pytorch.contact_graspnet import (
+                ContactGraspNet,
+                load_config,
+            )
+            from contact_graspnet_pytorch.inference import GraspEstimator
+
+            # Load config and model
+            if self.checkpoint_dir:
+                config = load_config(self.checkpoint_dir)
+                self.grasp_estimator = GraspEstimator(
+                    config,
+                    checkpoint_dir=self.checkpoint_dir,
+                    device=self.device,
+                )
+            else:
+                # Use default checkpoint path
+                import contact_graspnet_pytorch
+                pkg_dir = contact_graspnet_pytorch.__path__[0]
+                default_ckpt = f"{pkg_dir}/../checkpoints/contact_graspnet"
+                config = load_config(default_ckpt)
+                self.grasp_estimator = GraspEstimator(
+                    config,
+                    checkpoint_dir=default_ckpt,
+                    device=self.device,
+                )
+
+            self._model_loaded = True
+            print("[ContactGraspNetSelector] Model loaded successfully")
+
+        except ImportError as e:
+            self._load_error = f"contact_graspnet_pytorch not installed: {e}"
+            print(f"[ContactGraspNetSelector] {self._load_error}")
+            print("  Install from: https://github.com/elchun/contact_graspnet_pytorch")
+
+        except Exception as e:
+            self._load_error = f"Failed to load model: {e}"
+            print(f"[ContactGraspNetSelector] {self._load_error}")
+
+    def select_grasp(
+        self,
+        obj_pose: np.ndarray,
+        obj_name: str,
+        obj_type: Optional[str] = None,
+        gripper_pose: Optional[np.ndarray] = None,
+        point_cloud: Optional[np.ndarray] = None,
+        rgb_image: Optional[np.ndarray] = None,
+        depth_image: Optional[np.ndarray] = None,
+        camera_intrinsics: Optional[np.ndarray] = None,
+        segmentation_mask: Optional[np.ndarray] = None,
+        approach_strategy: str = "top_down",
+        **kwargs,
+    ) -> Tuple[GraspPose, Dict[str, Any]]:
+        """Select grasp using Contact-GraspNet.
+
+        Args:
+            obj_pose: Object pose [x, y, z, qw, qx, qy, qz]
+            obj_name: Object name
+            obj_type: Object type (bowl, mug, etc.)
+            gripper_pose: Current gripper pose
+            point_cloud: Object point cloud (N, 3) in world frame
+            rgb_image: RGB image (optional, for visualization)
+            depth_image: Depth image (used if point_cloud not provided)
+            camera_intrinsics: Camera K matrix (3x3)
+            segmentation_mask: Object segmentation mask (optional)
+            approach_strategy: Approach direction hint
+            **kwargs: Additional arguments
+
+        Returns:
+            Tuple of (GraspPose, info_dict)
+        """
+        info = {
+            "method": "contact_graspnet",
+            "fallback": False,
+            "model_loaded": self._model_loaded,
+        }
+
+        # Check if model is loaded
+        if not self._model_loaded:
+            info["fallback"] = True
+            info["fallback_reason"] = self._load_error or "model_not_loaded"
+            return self._fallback_heuristic(obj_pose, obj_name, approach_strategy, info)
+
+        # Get or create point cloud
+        if point_cloud is None:
+            if depth_image is not None and camera_intrinsics is not None:
+                point_cloud = self._depth_to_pointcloud(
+                    depth_image, camera_intrinsics, segmentation_mask
+                )
+            else:
+                info["fallback"] = True
+                info["fallback_reason"] = "no_point_cloud_or_depth"
+                return self._fallback_heuristic(obj_pose, obj_name, approach_strategy, info)
+
+        if point_cloud.shape[0] < 10:
+            info["fallback"] = True
+            info["fallback_reason"] = f"insufficient_points: {point_cloud.shape[0]}"
+            return self._fallback_heuristic(obj_pose, obj_name, approach_strategy, info)
+
+        # Run Contact-GraspNet inference
+        try:
+            grasps = self._run_inference(point_cloud, segmentation_mask)
+
+            if len(grasps) == 0:
+                info["fallback"] = True
+                info["fallback_reason"] = "no_grasps_found"
+                return self._fallback_heuristic(obj_pose, obj_name, approach_strategy, info)
+
+            # Convert best grasp to GraspPose
+            best_grasp = grasps[0]
+            info["n_candidates"] = len(grasps)
+            info["best_score"] = float(best_grasp["score"])
+
+            grasp_pose = GraspPose(
+                position=best_grasp["position"],
+                orientation=best_grasp["orientation"],
+                gripper_width=best_grasp.get("width", 0.04),
+                confidence=best_grasp["score"],
+                approach_direction=best_grasp.get("approach", None),
+                strategy="contact_graspnet",
+                metadata={"grasp_index": 0},
+            )
+
+            return grasp_pose, info
+
+        except Exception as e:
+            info["fallback"] = True
+            info["fallback_reason"] = f"inference_error: {e}"
+            return self._fallback_heuristic(obj_pose, obj_name, approach_strategy, info)
+
+    def select_multiple_grasps(
+        self,
+        obj_pose: np.ndarray,
+        obj_name: str,
+        n_grasps: int = 5,
+        **kwargs,
+    ) -> List[Tuple[GraspPose, Dict[str, Any]]]:
+        """Select multiple grasp candidates from Contact-GraspNet."""
+        if not self._model_loaded:
+            # Use heuristic fallback
+            heuristic = HeuristicGraspSelector()
+            return heuristic.select_multiple_grasps(obj_pose, obj_name, n_grasps, **kwargs)
+
+        # Get point cloud from kwargs
+        point_cloud = kwargs.get("point_cloud")
+        if point_cloud is None:
+            depth_image = kwargs.get("depth_image")
+            camera_intrinsics = kwargs.get("camera_intrinsics")
+            if depth_image is not None and camera_intrinsics is not None:
+                point_cloud = self._depth_to_pointcloud(depth_image, camera_intrinsics)
+
+        if point_cloud is None or point_cloud.shape[0] < 10:
+            heuristic = HeuristicGraspSelector()
+            return heuristic.select_multiple_grasps(obj_pose, obj_name, n_grasps, **kwargs)
+
+        try:
+            grasps = self._run_inference(point_cloud, kwargs.get("segmentation_mask"))
+            results = []
+
+            for i, g in enumerate(grasps[:n_grasps]):
+                grasp_pose = GraspPose(
+                    position=g["position"],
+                    orientation=g["orientation"],
+                    gripper_width=g.get("width", 0.04),
+                    confidence=g["score"],
+                    approach_direction=g.get("approach", None),
+                    strategy="contact_graspnet",
+                    metadata={"grasp_index": i},
+                )
+                info = {
+                    "method": "contact_graspnet",
+                    "fallback": False,
+                    "grasp_index": i,
+                    "score": float(g["score"]),
+                }
+                results.append((grasp_pose, info))
+
+            return results if results else [(self._fallback_heuristic(
+                obj_pose, obj_name, "top_down", {}
+            ))]
+
+        except Exception:
+            heuristic = HeuristicGraspSelector()
+            return heuristic.select_multiple_grasps(obj_pose, obj_name, n_grasps, **kwargs)
+
+    def _run_inference(
+        self,
+        point_cloud: np.ndarray,
+        segmentation_mask: Optional[np.ndarray] = None,
+    ) -> List[Dict[str, Any]]:
+        """Run Contact-GraspNet inference.
+
+        Args:
+            point_cloud: (N, 3) point cloud in world frame
+            segmentation_mask: Optional (H, W) segmentation mask
+
+        Returns:
+            List of grasp dictionaries with keys:
+            - position: (3,) grasp position
+            - orientation: (3, 3) rotation matrix or (4,) quaternion
+            - score: confidence score
+            - width: gripper width
+            - approach: approach direction
+        """
+        if self.grasp_estimator is None:
+            return []
+
+        # Filter point cloud by z range
+        z_mask = (point_cloud[:, 2] >= self.z_range[0]) & (point_cloud[:, 2] <= self.z_range[1])
+        filtered_pc = point_cloud[z_mask]
+
+        if filtered_pc.shape[0] < 10:
+            return []
+
+        # Run inference
+        # Contact-GraspNet expects point cloud as dict with 'xyz' key
+        pc_dict = {"xyz": filtered_pc}
+
+        pred_grasps, pred_scores, pred_widths = self.grasp_estimator.predict_grasps(
+            pc_dict,
+            forward_passes=self.forward_passes,
+            filter_grasps=self.filter_grasps,
+        )
+
+        # Convert to list of grasp dictionaries
+        grasps = []
+        for i in range(len(pred_scores)):
+            if pred_scores[i] >= self.score_threshold:
+                # pred_grasps[i] is a 4x4 transform matrix
+                grasp_transform = pred_grasps[i]
+                position = grasp_transform[:3, 3]
+                rotation = grasp_transform[:3, :3]
+
+                # Convert rotation matrix to quaternion [w, x, y, z]
+                from scipy.spatial.transform import Rotation as R
+                quat = R.from_matrix(rotation).as_quat()  # [x, y, z, w]
+                orientation = np.array([quat[3], quat[0], quat[1], quat[2]])
+
+                grasps.append({
+                    "position": position,
+                    "orientation": orientation,
+                    "score": float(pred_scores[i]),
+                    "width": float(pred_widths[i]) if pred_widths is not None else 0.04,
+                    "approach": -rotation[:, 2],  # Z-axis of grasp frame
+                })
+
+        # Sort by score descending
+        grasps.sort(key=lambda g: g["score"], reverse=True)
+        return grasps
+
+    def _depth_to_pointcloud(
+        self,
+        depth_image: np.ndarray,
+        camera_intrinsics: np.ndarray,
+        segmentation_mask: Optional[np.ndarray] = None,
+    ) -> np.ndarray:
+        """Convert depth image to point cloud."""
+        h, w = depth_image.shape[:2]
+        fx, fy = camera_intrinsics[0, 0], camera_intrinsics[1, 1]
+        cx, cy = camera_intrinsics[0, 2], camera_intrinsics[1, 2]
+
+        u, v = np.meshgrid(np.arange(w), np.arange(h))
+        if depth_image.ndim == 3:
+            z = depth_image[:, :, 0]
+        else:
+            z = depth_image
+
+        x = (u - cx) * z / fx
+        y = (v - cy) * z / fy
+
+        points = np.stack([x, y, z], axis=-1).reshape(-1, 3)
+        valid = z.flatten() > 0.1
+
+        # Apply segmentation mask if provided
+        if segmentation_mask is not None:
+            seg_mask = segmentation_mask.flatten() > 0
+            valid = valid & seg_mask
+
+        return points[valid]
+
+    def _fallback_heuristic(
+        self,
+        obj_pose: np.ndarray,
+        obj_name: str,
+        approach_strategy: str,
+        info: Dict[str, Any],
+    ) -> Tuple[GraspPose, Dict[str, Any]]:
+        """Fall back to heuristic grasp selection."""
+        heuristic = HeuristicGraspSelector()
+        grasp, heuristic_info = heuristic.select_grasp(
+            obj_pose, obj_name, approach_strategy=approach_strategy
+        )
+        info.update(heuristic_info)
+        return grasp, info
+
+
 # Factory function for creating selectors
 _SELECTOR_REGISTRY = {
     "heuristic": HeuristicGraspSelector,
     "giga": GIGAGraspSelector,
+    "contact_graspnet": ContactGraspNetSelector,
 }
 
 
