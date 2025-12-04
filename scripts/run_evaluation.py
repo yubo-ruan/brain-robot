@@ -770,8 +770,8 @@ def main():
     parser.add_argument("--n-episodes", type=int, default=20)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--output-dir", type=str, default="logs/evaluation")
-    parser.add_argument("--grasp-selector", type=str, choices=["heuristic", "contact_graspnet"], default="heuristic",
-                        help="Grasp selector: heuristic (rule-based) or contact_graspnet (learned 6-DoF)")
+    parser.add_argument("--grasp-selector", type=str, choices=["heuristic", "contact_graspnet", "hybrid"], default="heuristic",
+                        help="Grasp selector: heuristic (rule-based), contact_graspnet (learned 6-DoF), or hybrid (heuristic + CGN refinement)")
     args = parser.parse_args()
 
     # Validate model path for learned perception with YOLO

@@ -804,6 +804,227 @@ class GIGAGraspSelector(GraspSelector):
         return grasp, info
 
 
+class HybridGraspSelector(GraspSelector):
+    """Hybrid grasp selector combining heuristic positioning with learned refinement.
+
+    Strategy:
+    1. Use heuristic to get initial grasp position (rim offset for hollow objects)
+    2. Crop point cloud to local region around heuristic position (10cm radius)
+    3. Run Contact-GraspNet on LOCAL region only (reduces clutter, improves accuracy)
+    4. Filter CGN grasps to those near heuristic position (3cm threshold)
+    5. Pick highest-scoring CGN grasp, or fallback to heuristic if none valid
+
+    Benefits:
+    - Heuristic handles object scale and coordinate frame issues
+    - Learned model refines contact points and orientations locally
+    - Dramatically reduces CGN failure modes (grasps on table, far from object, etc.)
+    - Works with sparse point clouds by focusing on relevant region
+
+    Example:
+        selector = HybridGraspSelector()
+        grasp, info = selector.select_grasp(
+            obj_pose=obj_pose,
+            obj_name="akita_black_bowl_1_main",
+            depth_image=depth,
+            camera_intrinsics=K,
+            camera_extrinsics=T,
+        )
+    """
+
+    def __init__(
+        self,
+        local_radius: float = 0.10,
+        proximity_threshold: float = 0.03,
+        min_cgn_score: float = 0.5,
+        use_cgn: bool = True,
+        **heuristic_kwargs,
+    ):
+        """Initialize hybrid selector.
+
+        Args:
+            local_radius: Radius (m) around heuristic position to crop point cloud
+            proximity_threshold: Max distance (m) from heuristic for valid CGN grasps
+            min_cgn_score: Minimum CGN confidence score to accept refinement
+            use_cgn: Whether to use CGN refinement (if False, pure heuristic)
+            **heuristic_kwargs: Additional args for HeuristicGraspSelector
+        """
+        self.local_radius = local_radius
+        self.proximity_threshold = proximity_threshold
+        self.min_cgn_score = min_cgn_score
+        self.use_cgn = use_cgn
+
+        # Initialize heuristic selector (always needed for seed)
+        self.heuristic = HeuristicGraspSelector(**heuristic_kwargs)
+
+        # Initialize CGN selector if enabled
+        self.cgn = None
+        self.cgn_available = False
+        if use_cgn:
+            try:
+                self.cgn = ContactGraspNetSelector(
+                    score_threshold=min_cgn_score,
+                    filter_grasps=True,
+                )
+                self.cgn_available = self.cgn._model_loaded
+                if self.cgn_available:
+                    print("[HybridGraspSelector] CGN loaded successfully for refinement")
+                else:
+                    print("[HybridGraspSelector] CGN not available, using pure heuristic")
+            except Exception as e:
+                print(f"[HybridGraspSelector] Failed to load CGN: {e}")
+                self.cgn_available = False
+
+    def select_grasp(
+        self,
+        obj_pose: np.ndarray,
+        obj_name: str,
+        obj_type: Optional[str] = None,
+        gripper_pose: Optional[np.ndarray] = None,
+        point_cloud: Optional[np.ndarray] = None,
+        rgb_image: Optional[np.ndarray] = None,
+        depth_image: Optional[np.ndarray] = None,
+        camera_intrinsics: Optional[np.ndarray] = None,
+        camera_extrinsics: Optional[np.ndarray] = None,
+        segmentation_mask: Optional[np.ndarray] = None,
+        approach_strategy: str = "top_down",
+        **kwargs,
+    ) -> Tuple[GraspPose, Dict[str, Any]]:
+        """Select grasp using hybrid heuristic + learned approach.
+
+        Returns:
+            Tuple of (GraspPose, info_dict)
+        """
+        info = {
+            "method": "hybrid",
+            "cgn_available": self.cgn_available,
+            "used_cgn_refinement": False,
+        }
+
+        # Step 1: Get heuristic seed grasp
+        heuristic_grasp, heuristic_info = self.heuristic.select_grasp(
+            obj_pose=obj_pose,
+            obj_name=obj_name,
+            obj_type=obj_type,
+            gripper_pose=gripper_pose,
+            approach_strategy=approach_strategy,
+        )
+
+        info["heuristic"] = heuristic_info
+        heuristic_position = heuristic_grasp.position.copy()
+
+        # If CGN not available or disabled, return heuristic
+        if not self.cgn_available or not self.use_cgn:
+            info["fallback_reason"] = "cgn_not_available" if not self.cgn_available else "cgn_disabled"
+            heuristic_grasp.strategy = "hybrid_heuristic_only"
+            return heuristic_grasp, info
+
+        # Step 2: Get or create point cloud
+        if point_cloud is None:
+            if depth_image is not None and camera_intrinsics is not None:
+                point_cloud = self.cgn._depth_to_pointcloud(
+                    depth_image, camera_intrinsics, camera_extrinsics, segmentation_mask
+                )
+                info["point_cloud_source"] = "depth_image"
+            else:
+                info["fallback_reason"] = "no_point_cloud"
+                heuristic_grasp.strategy = "hybrid_heuristic_only"
+                return heuristic_grasp, info
+
+        if point_cloud is None or point_cloud.shape[0] < 10:
+            info["fallback_reason"] = "insufficient_points"
+            heuristic_grasp.strategy = "hybrid_heuristic_only"
+            return heuristic_grasp, info
+
+        # Step 3: Crop point cloud to local region around heuristic position
+        distances = np.linalg.norm(point_cloud - heuristic_position, axis=1)
+        local_mask = distances <= self.local_radius
+        local_point_cloud = point_cloud[local_mask]
+
+        info["total_points"] = point_cloud.shape[0]
+        info["local_points"] = local_point_cloud.shape[0]
+        info["crop_radius"] = self.local_radius
+        info["heuristic_position"] = heuristic_position.tolist()
+
+        # Need at least 50 points in local region for meaningful grasp prediction
+        if local_point_cloud.shape[0] < 50:
+            info["fallback_reason"] = f"too_few_local_points: {local_point_cloud.shape[0]}"
+            heuristic_grasp.strategy = "hybrid_heuristic_only"
+            return heuristic_grasp, info
+
+        # Step 4: Run CGN on local point cloud
+        try:
+            cgn_grasps = self.cgn._run_inference(local_point_cloud, segmentation_mask)
+            info["cgn_grasps_raw"] = len(cgn_grasps)
+
+            if len(cgn_grasps) == 0:
+                info["fallback_reason"] = "no_cgn_grasps"
+                heuristic_grasp.strategy = "hybrid_heuristic_only"
+                return heuristic_grasp, info
+
+            # Step 5: Filter CGN grasps by proximity to heuristic position
+            valid_grasps = []
+            for g in cgn_grasps:
+                dist = np.linalg.norm(g["position"] - heuristic_position)
+                if dist <= self.proximity_threshold and g["score"] >= self.min_cgn_score:
+                    g["distance_to_heuristic"] = dist
+                    # Bonus for being close to heuristic (within reason)
+                    proximity_bonus = (1.0 - dist / self.proximity_threshold) * 0.2
+                    g["hybrid_score"] = g["score"] + proximity_bonus
+                    valid_grasps.append(g)
+
+            info["cgn_grasps_filtered"] = len(valid_grasps)
+
+            if len(valid_grasps) == 0:
+                info["fallback_reason"] = "no_nearby_cgn_grasps"
+                heuristic_grasp.strategy = "hybrid_heuristic_only"
+                return heuristic_grasp, info
+
+            # Step 6: Pick best CGN grasp (by hybrid score)
+            valid_grasps.sort(key=lambda g: g["hybrid_score"], reverse=True)
+            best_grasp = valid_grasps[0]
+
+            info["used_cgn_refinement"] = True
+            info["cgn_score"] = float(best_grasp["score"])
+            info["hybrid_score"] = float(best_grasp["hybrid_score"])
+            info["distance_to_heuristic"] = float(best_grasp["distance_to_heuristic"])
+
+            # Use CGN position and width, but keep heuristic orientation for robosuite compatibility
+            # (Can optionally use CGN orientation if use_cgn_orientation=True)
+            grasp_pose = GraspPose(
+                position=best_grasp["position"],
+                orientation=heuristic_grasp.orientation.copy(),  # Use heuristic orientation
+                gripper_width=best_grasp.get("width", heuristic_grasp.gripper_width),
+                confidence=best_grasp["hybrid_score"],
+                strategy="hybrid_cgn_refined",
+                metadata={
+                    "original_cgn_orientation": best_grasp["orientation"].tolist() if hasattr(best_grasp["orientation"], "tolist") else best_grasp["orientation"],
+                    "heuristic_position": heuristic_position.tolist(),
+                    "cgn_position": best_grasp["position"].tolist(),
+                    "refinement_offset": (best_grasp["position"] - heuristic_position).tolist(),
+                },
+            )
+
+            return grasp_pose, info
+
+        except Exception as e:
+            info["fallback_reason"] = f"cgn_inference_error: {e}"
+            heuristic_grasp.strategy = "hybrid_heuristic_only"
+            return heuristic_grasp, info
+
+    def select_multiple_grasps(
+        self,
+        obj_pose: np.ndarray,
+        obj_name: str,
+        n_grasps: int = 5,
+        **kwargs,
+    ) -> List[Tuple[GraspPose, Dict[str, Any]]]:
+        """Select multiple grasp candidates using hybrid approach."""
+        # For now, return single best grasp
+        # Could extend to return top-N CGN grasps in proximity to heuristic
+        primary, info = self.select_grasp(obj_pose, obj_name, **kwargs)
+        return [(primary, info)]
+
+
 # Global cache for Contact-GraspNet model to avoid reloading every episode
 _CGN_MODEL_CACHE = {
     "grasp_estimator": None,
@@ -1333,6 +1554,7 @@ _SELECTOR_REGISTRY = {
     "heuristic": HeuristicGraspSelector,
     "giga": GIGAGraspSelector,
     "contact_graspnet": ContactGraspNetSelector,
+    "hybrid": HybridGraspSelector,
 }
 
 
