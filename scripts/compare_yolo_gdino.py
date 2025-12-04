@@ -1,13 +1,14 @@
 #!/usr/bin/env python3
-"""Compare YOLO vs Grounding-DINO on libero_object tasks.
+"""Compare YOLO vs Grounding-DINO vs Grounded-SAM on libero_object tasks.
 
-Evaluates target detection accuracy for both detectors across all 10 tasks.
+Evaluates target detection accuracy for all detectors across all 10 tasks.
 
 Usage:
     python scripts/compare_yolo_gdino.py
     python scripts/compare_yolo_gdino.py --detector yolo
     python scripts/compare_yolo_gdino.py --detector gdino
-    python scripts/compare_yolo_gdino.py --detector both
+    python scripts/compare_yolo_gdino.py --detector gsam  # Grounding-DINO + SAM2
+    python scripts/compare_yolo_gdino.py --detector all
 """
 
 import argparse
@@ -103,8 +104,8 @@ def evaluate_task(
     total_frames = 0
     total_time = 0.0
 
-    # Set target for Grounding-DINO
-    if detector_type == "gdino":
+    # Set target for Grounding-DINO or Grounded-SAM
+    if detector_type in ["gdino", "gsam"]:
         detector.set_target_objects([target])
 
     for ep in range(n_episodes):
@@ -163,9 +164,13 @@ def run_evaluation(detector_type: str, n_episodes: int = 3, n_steps: int = 10):
         from brain_robot.perception.detection.yolo_detector import YOLOObjectDetector
         detector = YOLOObjectDetector(model_path="models/yolo_libero_v4.pt")
         detector.warmup()
-    else:  # gdino
+    elif detector_type == "gdino":
         from brain_robot.perception.detection.grounding_dino_detector import GroundingDINODetector
         detector = GroundingDINODetector()
+        detector.warmup()
+    else:  # gsam
+        from brain_robot.perception.detection.grounded_sam_detector import GroundedSAMDetector
+        detector = GroundedSAMDetector()
         detector.warmup()
 
     results = []
@@ -195,17 +200,15 @@ def run_evaluation(detector_type: str, n_episodes: int = 3, n_steps: int = 10):
     return results
 
 
-def print_summary(yolo_results: Optional[List[TaskResult]], gdino_results: Optional[List[TaskResult]]):
+def print_summary(
+    yolo_results: Optional[List[TaskResult]],
+    gdino_results: Optional[List[TaskResult]],
+    gsam_results: Optional[List[TaskResult]] = None,
+):
     """Print comparison summary."""
-    print(f"\n{'='*70}")
+    print(f"\n{'='*80}")
     print("SUMMARY")
-    print(f"{'='*70}")
-
-    headers = ["Task", "Target"]
-    if yolo_results:
-        headers.extend(["YOLO", "Conf"])
-    if gdino_results:
-        headers.extend(["GDINO", "Conf"])
+    print(f"{'='*80}")
 
     # Print header
     print(f"\n{'Task':<6} {'Target':<20}", end="")
@@ -213,8 +216,10 @@ def print_summary(yolo_results: Optional[List[TaskResult]], gdino_results: Optio
         print(f"{'YOLO':<8} {'Conf':<6}", end="")
     if gdino_results:
         print(f"{'GDINO':<8} {'Conf':<6}", end="")
+    if gsam_results:
+        print(f"{'GSAM':<8} {'Conf':<6}", end="")
     print()
-    print("-" * 70)
+    print("-" * 80)
 
     # Print rows
     for i in range(10):
@@ -231,10 +236,15 @@ def print_summary(yolo_results: Optional[List[TaskResult]], gdino_results: Optio
             status = "✓" if r.detected else "✗"
             print(f"{status:<8} {r.avg_confidence:.2f}  ", end="")
 
+        if gsam_results:
+            r = gsam_results[i]
+            status = "✓" if r.detected else "✗"
+            print(f"{status:<8} {r.avg_confidence:.2f}  ", end="")
+
         print()
 
     # Print totals
-    print("-" * 70)
+    print("-" * 80)
     print(f"{'TOTAL':<6} {'':<20}", end="")
 
     if yolo_results:
@@ -247,27 +257,53 @@ def print_summary(yolo_results: Optional[List[TaskResult]], gdino_results: Optio
         avg_time = np.mean([r.inference_time_ms for r in gdino_results])
         print(f"{passed}/10    {avg_time:.0f}ms ", end="")
 
+    if gsam_results:
+        passed = sum(1 for r in gsam_results if r.detected)
+        avg_time = np.mean([r.inference_time_ms for r in gsam_results])
+        print(f"{passed}/10    {avg_time:.0f}ms ", end="")
+
     print()
 
     # Final comparison
+    print(f"\n{'='*80}")
+    print("COMPARISON")
+    print(f"{'='*80}")
+
+    if yolo_results:
+        yolo_pass = sum(1 for r in yolo_results if r.detected)
+        yolo_time = np.mean([r.inference_time_ms for r in yolo_results])
+        print(f"  YOLO V4:        {yolo_pass}/10 tasks ({yolo_pass*10}%), avg {yolo_time:.0f}ms")
+
+    if gdino_results:
+        gdino_pass = sum(1 for r in gdino_results if r.detected)
+        gdino_time = np.mean([r.inference_time_ms for r in gdino_results])
+        print(f"  Grounding-DINO: {gdino_pass}/10 tasks ({gdino_pass*10}%), avg {gdino_time:.0f}ms")
+
+    if gsam_results:
+        gsam_pass = sum(1 for r in gsam_results if r.detected)
+        gsam_time = np.mean([r.inference_time_ms for r in gsam_results])
+        print(f"  Grounded-SAM:   {gsam_pass}/10 tasks ({gsam_pass*10}%), avg {gsam_time:.0f}ms")
+
+    # Show improvement if all present
     if yolo_results and gdino_results:
         yolo_pass = sum(1 for r in yolo_results if r.detected)
         gdino_pass = sum(1 for r in gdino_results if r.detected)
         yolo_time = np.mean([r.inference_time_ms for r in yolo_results])
         gdino_time = np.mean([r.inference_time_ms for r in gdino_results])
+        print(f"\n  GDINO vs YOLO: +{gdino_pass - yolo_pass} tasks, +{gdino_time - yolo_time:.0f}ms latency")
 
-        print(f"\n{'='*70}")
-        print("COMPARISON")
-        print(f"{'='*70}")
-        print(f"  YOLO V4:        {yolo_pass}/10 tasks ({yolo_pass*10}%), avg {yolo_time:.0f}ms")
-        print(f"  Grounding-DINO: {gdino_pass}/10 tasks ({gdino_pass*10}%), avg {gdino_time:.0f}ms")
-        print(f"  Improvement:    +{gdino_pass - yolo_pass} tasks, +{gdino_time - yolo_time:.0f}ms latency")
+    if yolo_results and gsam_results:
+        yolo_pass = sum(1 for r in yolo_results if r.detected)
+        gsam_pass = sum(1 for r in gsam_results if r.detected)
+        yolo_time = np.mean([r.inference_time_ms for r in yolo_results])
+        gsam_time = np.mean([r.inference_time_ms for r in gsam_results])
+        print(f"  GSAM vs YOLO:  +{gsam_pass - yolo_pass} tasks, +{gsam_time - yolo_time:.0f}ms latency (+ masks)")
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Compare YOLO vs Grounding-DINO")
-    parser.add_argument("--detector", choices=["yolo", "gdino", "both"], default="both",
-                        help="Which detector to evaluate")
+    parser = argparse.ArgumentParser(description="Compare YOLO vs Grounding-DINO vs Grounded-SAM")
+    parser.add_argument("--detector", choices=["yolo", "gdino", "gsam", "all"], default="all",
+                        help="Which detector to evaluate (gsam = Grounding-DINO + SAM2)")
     parser.add_argument("--episodes", type=int, default=3,
                         help="Episodes per task")
     parser.add_argument("--steps", type=int, default=10,
@@ -276,14 +312,18 @@ def main():
 
     yolo_results = None
     gdino_results = None
+    gsam_results = None
 
-    if args.detector in ["yolo", "both"]:
+    if args.detector in ["yolo", "all"]:
         yolo_results = run_evaluation("yolo", args.episodes, args.steps)
 
-    if args.detector in ["gdino", "both"]:
+    if args.detector in ["gdino", "all"]:
         gdino_results = run_evaluation("gdino", args.episodes, args.steps)
 
-    print_summary(yolo_results, gdino_results)
+    if args.detector in ["gsam", "all"]:
+        gsam_results = run_evaluation("gsam", args.episodes, args.steps)
+
+    print_summary(yolo_results, gdino_results, gsam_results)
 
 
 if __name__ == "__main__":

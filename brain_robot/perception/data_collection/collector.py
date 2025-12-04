@@ -19,6 +19,7 @@ from ..interface import PerceptionResult
 
 # LIBERO object classes for detection
 LIBERO_OBJECT_CLASSES = [
+    # Kitchen objects (libero_spatial)
     "bowl",
     "plate",
     "mug",
@@ -29,6 +30,18 @@ LIBERO_OBJECT_CLASSES = [
     "can",
     "bottle",
     "stove",
+    # Grocery items (libero_object)
+    "alphabet_soup",
+    "basket",
+    "bbq_sauce",
+    "butter",
+    "chocolate_pudding",
+    "cream_cheese",
+    "ketchup",
+    "milk",
+    "orange_juice",
+    "salad_dressing",
+    "tomato_sauce",
 ]
 
 

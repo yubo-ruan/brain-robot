@@ -1,10 +1,15 @@
-"""Learned perception using YOLO detection + depth-based pose estimation.
+"""Learned perception using detection + depth-based pose estimation.
 
 This is the pragmatic "Option B" approach:
-- YOLO for 2D detection (class + bbox)
+- Detection for 2D detection (class + bbox)
 - Depth image for 3D position (bbox center → depth lookup → 3D)
 - Tracker for instance ID persistence
 - Reuse oracle's spatial relation computation
+
+Supported detectors:
+- yolo: YOLO-based detection (fast, requires training)
+- gdino: Grounding-DINO (open-vocabulary, ~120ms)
+- gsam: Grounded-SAM (open-vocabulary + masks, ~130ms)
 
 Why depth-based instead of learned pose regression:
 1. Simpler - no additional training required
@@ -86,16 +91,20 @@ class LearnedPerception(PerceptionInterface):
         use_median_depth: bool = True,  # Use median vs mean for depth
         camera_name: str = "agentview",
         image_size: Tuple[int, int] = (256, 256),
+        detector_type: str = "yolo",  # yolo, gdino, gsam
+        target_objects: Optional[List[str]] = None,  # For open-vocab detectors
     ):
         """Initialize learned perception.
 
         Args:
-            model_path: Path to trained YOLO model
+            model_path: Path to trained YOLO model (only used if detector_type="yolo")
             confidence_threshold: Detection confidence threshold
             depth_patch_size: Size of patch around bbox center for depth sampling
             use_median_depth: Use median (robust) vs mean for depth
             camera_name: Camera to use for perception
             image_size: Rendering resolution
+            detector_type: Type of detector ("yolo", "gdino", "gsam")
+            target_objects: List of target object names for open-vocab detectors
         """
         self.model_path = model_path
         self.confidence_threshold = confidence_threshold
@@ -103,21 +112,23 @@ class LearnedPerception(PerceptionInterface):
         self.use_median_depth = use_median_depth
         self.camera_name = camera_name
         self.image_size = image_size
+        self.detector_type = detector_type
+        self.target_objects = target_objects or []
 
-        # Initialize detector
-        self.detector = YOLOObjectDetector(
-            model_path=model_path,
-            confidence_threshold=confidence_threshold,
-        )
+        # Initialize detector based on type
+        self.detector = self._create_detector(detector_type, model_path, confidence_threshold)
 
         # Initialize tracker
         # More tolerant settings for robustness:
         # - Higher association threshold (objects can move between frames)
         # - More max_misses (detector may miss objects for several frames)
+        # - For open-vocab detectors (gsam/gdino), preserve bootstrap positions
+        #   since depth-based 3D is less calibrated
         self.tracker = NearestNeighborTracker(
             association_threshold=0.20,  # 20cm for association
             max_misses=30,  # Allow 30 misses before marking inactive
             min_confidence=0.05,  # Lower confidence threshold to keep tracks alive
+            preserve_bootstrap_positions=(detector_type in ["gsam", "gdino"]),
         )
 
         # Camera parameters (updated from sim)
@@ -136,6 +147,53 @@ class LearnedPerception(PerceptionInterface):
         # Depth conversion scale (calibrated from environment)
         # Default value for LIBERO: extent * znear ≈ 0.011
         self._depth_scale = 0.011
+
+    def _create_detector(self, detector_type: str, model_path: str, confidence_threshold: float):
+        """Create detector based on type.
+
+        Args:
+            detector_type: Type of detector ("yolo", "gdino", "gsam")
+            model_path: Path to YOLO model (only used for yolo)
+            confidence_threshold: Detection confidence threshold
+
+        Returns:
+            Detector instance implementing detect() method
+        """
+        if detector_type == "yolo":
+            return YOLOObjectDetector(
+                model_path=model_path,
+                confidence_threshold=confidence_threshold,
+            )
+        elif detector_type == "gdino":
+            from .detection.grounding_dino_detector import GroundingDINODetector
+            detector = GroundingDINODetector(
+                box_threshold=confidence_threshold,
+            )
+            # Set targets if provided
+            if self.target_objects:
+                detector.set_target_objects(self.target_objects)
+            return detector
+        elif detector_type == "gsam":
+            from .detection.grounded_sam_detector import GroundedSAMDetector
+            detector = GroundedSAMDetector(
+                box_threshold=confidence_threshold,
+            )
+            # Set targets if provided
+            if self.target_objects:
+                detector.set_target_objects(self.target_objects)
+            return detector
+        else:
+            raise ValueError(f"Unknown detector type: {detector_type}. Use 'yolo', 'gdino', or 'gsam'.")
+
+    def set_target_objects(self, target_objects: List[str]):
+        """Set target objects for open-vocabulary detectors.
+
+        Args:
+            target_objects: List of object names to detect (e.g., ["bbq_sauce", "basket"])
+        """
+        self.target_objects = target_objects
+        if self.detector_type in ["gdino", "gsam"]:
+            self.detector.set_target_objects(target_objects)
 
     def bootstrap_from_oracle(
         self,
@@ -326,14 +384,14 @@ class LearnedPerception(PerceptionInterface):
         """Convert 2D detections to 3D using depth image.
 
         For each detection:
-        1. Get bbox center
-        2. Sample depth in patch around center (robust to noise)
+        1. If mask available (gsam): use mask-based depth sampling for accuracy
+        2. Otherwise: sample depth from bbox with multi-point strategy
         3. Back-project to 3D using camera intrinsics
         4. Transform to world frame
         5. Validate position is within workspace bounds
 
         Args:
-            detections_2d: List of 2D detections from YOLO
+            detections_2d: List of 2D detections (may include masks for gsam)
             depth: Depth image from MuJoCo
 
         Returns:
@@ -342,41 +400,46 @@ class LearnedPerception(PerceptionInterface):
         detections_3d = []
 
         # LIBERO workspace bounds (approximate)
-        # X: -0.5 to 0.5 (left-right)
-        # Y: -0.5 to 0.5 (front-back)
-        # Z: 0.8 to 1.3 (height, table at ~0.9)
+        # Different scenes have different coordinate systems:
+        # - libero_spatial: table at ~0.9, objects at Z: 0.8-1.3
+        # - libero_object: floor-level scene, objects at Z: -0.1 to 0.5
+        # Use permissive bounds that cover all LIBERO scenes
         WORKSPACE_BOUNDS = {
-            'x': (-0.6, 0.6),
-            'y': (-0.5, 0.5),
-            'z': (0.7, 1.4),
+            'x': (-1.0, 1.0),
+            'y': (-1.0, 1.0),
+            'z': (-0.2, 1.5),  # Cover both floor-level and table-level scenes
         }
 
         for det in detections_2d:
             if det.bbox is None or len(det.bbox) != 4:
                 continue
 
-            # Multi-point depth sampling: returns (depth, cx, cy) where cx,cy
-            # are the pixel coordinates of the point with minimum valid depth.
-            # This ensures the back-projection uses consistent depth + pixel coords.
-            depth_result = self._sample_depth_bbox(depth, det.bbox)
+            # Check if detection has a mask (from gsam detector)
+            has_mask = hasattr(det, 'mask') and det.mask is not None
 
-            if depth_result is None:
-                continue
-
-            z, cx, cy = depth_result
-
-            if z <= 0:
-                continue
-
-            # Skip depth values too close to far plane (likely background)
-            if z >= 0.995:
-                continue
-
-            # Back-project to camera frame using the exact pixel where depth was sampled
-            point_cam = self._pixel_to_camera(cx, cy, z)
-
-            # Transform to world frame
-            point_world = self._camera_to_world(point_cam)
+            if has_mask:
+                # Use mask-based 3D position estimation for precision
+                point_world = self._mask_to_3d_position(det.mask, depth)
+                if point_world is None:
+                    # Fallback to bbox-based sampling if mask fails
+                    depth_result = self._sample_depth_bbox(depth, det.bbox)
+                    if depth_result is None:
+                        continue
+                    z, cx, cy = depth_result
+                    if z <= 0 or z >= 0.995:
+                        continue
+                    point_cam = self._pixel_to_camera(cx, cy, z)
+                    point_world = self._camera_to_world(point_cam)
+            else:
+                # Standard bbox-based depth sampling
+                depth_result = self._sample_depth_bbox(depth, det.bbox)
+                if depth_result is None:
+                    continue
+                z, cx, cy = depth_result
+                if z <= 0 or z >= 0.995:
+                    continue
+                point_cam = self._pixel_to_camera(cx, cy, z)
+                point_world = self._camera_to_world(point_cam)
 
             # Validate position is within workspace
             x, y, z_world = point_world
@@ -396,6 +459,70 @@ class LearnedPerception(PerceptionInterface):
             detections_3d.append(det_3d)
 
         return detections_3d
+
+    def _mask_to_3d_position(
+        self,
+        mask: np.ndarray,
+        depth: np.ndarray,
+    ) -> Optional[np.ndarray]:
+        """Compute 3D position from segmentation mask and depth.
+
+        Uses the mask to sample depth only from object pixels, then computes
+        the 3D centroid of the masked region. This is more accurate than
+        bbox-based sampling for small/thin objects.
+
+        Args:
+            mask: Binary mask (H, W), True for object pixels
+            depth: Normalized depth image (H, W) from MuJoCo
+
+        Returns:
+            3D position in world frame, or None if no valid depth
+        """
+        if mask is None or not mask.any():
+            return None
+
+        # Get all pixel coordinates where mask is True
+        ys, xs = np.where(mask)
+
+        if len(xs) == 0:
+            return None
+
+        # Get depth values at mask pixels
+        mask_depths = depth[ys, xs]
+
+        # Filter valid depth values (not at far plane, not zero)
+        valid_mask = (mask_depths > 0) & (mask_depths < 0.995) & np.isfinite(mask_depths)
+        valid_depths = mask_depths[valid_mask]
+        valid_xs = xs[valid_mask]
+        valid_ys = ys[valid_mask]
+
+        if len(valid_depths) == 0:
+            return None
+
+        # Strategy: Use the front surface (minimum depth) for grasp target
+        # This ensures we target the visible/graspable part of the object
+        min_depth_idx = np.argmin(valid_depths)
+        z_normalized = valid_depths[min_depth_idx]
+
+        # Use centroid of pixels near the minimum depth (front surface)
+        # This gives a more stable position than a single pixel
+        depth_threshold = z_normalized + 0.02  # Within 2% of min depth
+        front_mask = valid_depths <= depth_threshold
+        front_xs = valid_xs[front_mask]
+        front_ys = valid_ys[front_mask]
+
+        # Compute centroid of front surface pixels
+        cx = float(np.mean(front_xs))
+        cy = float(np.mean(front_ys))
+        z = float(np.mean(valid_depths[front_mask]))
+
+        # Back-project to camera frame
+        point_cam = self._pixel_to_camera(cx, cy, z)
+
+        # Transform to world frame
+        point_world = self._camera_to_world(point_cam)
+
+        return point_world
 
     def _sample_depth_bbox(
         self,

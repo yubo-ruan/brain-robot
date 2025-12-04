@@ -325,56 +325,155 @@ class HeuristicGraspSelector(GraspSelector):
 
 
 class GIGAGraspSelector(GraspSelector):
-    """6-DoF grasp affordance model (GIGA) integration.
+    """6-DoF grasp affordance model (GIGA/VGN) integration.
 
-    GIGA predicts dense grasp affordances from point clouds or depth images.
-    This selector loads a pre-trained GIGA model and queries it for grasp poses.
+    GIGA/VGN predicts dense grasp affordances from TSDF voxel grids.
+    Takes depth image, creates TSDF, runs through 3D CNN to predict:
+    - Grasp quality (per-voxel confidence)
+    - Grasp orientation (quaternion)
+    - Gripper width
 
     Paper: https://arxiv.org/abs/2104.01542
+    GitHub: https://github.com/UT-Austin-RPL/GIGA
 
-    Note: This is a stub implementation. Full integration requires:
-    1. GIGA model weights (giga.pth)
-    2. Point cloud extraction from LIBERO observations
-    3. Coordinate frame transformations (camera -> world)
+    Input: Depth image + camera intrinsics/extrinsics
+    Output: 6-DoF grasp poses in world frame
+
+    Note: Requires open3d for TSDF fusion. Model weights can be VGN or GIGA.
     """
+
+    # TSDF volume parameters (tuned for LIBERO tabletop)
+    TSDF_SIZE = 0.3  # 30cm cube
+    TSDF_RESOLUTION = 40  # 40x40x40 voxels
+
+    # Workspace bounds in world frame (LIBERO table)
+    # Table is at ~0.8m height, objects are 0.8-1.2m
+    WORKSPACE_CENTER = np.array([0.0, 0.15, 0.95])  # Center of grasp volume
 
     def __init__(
         self,
         model_path: Optional[str] = None,
         device: str = "cuda",
-        voxel_size: float = 0.005,
+        tsdf_size: float = 0.3,
+        resolution: int = 40,
         score_threshold: float = 0.5,
-        grasp_height_offset: float = 0.04,  # Ignored by GIGA, but accepted for compatibility
-        **kwargs,  # Accept additional kwargs for compatibility
+        grasp_height_offset: float = 0.04,
+        **kwargs,
     ):
-        """Initialize GIGA selector.
+        """Initialize GIGA/VGN selector.
 
         Args:
-            model_path: Path to GIGA model weights
+            model_path: Path to VGN/GIGA model weights (.pt file)
             device: Device for inference ("cuda" or "cpu")
-            voxel_size: Voxel size for point cloud processing
+            tsdf_size: Size of TSDF volume in meters
+            resolution: TSDF voxel resolution (40 = 40x40x40)
             score_threshold: Minimum grasp quality score
+            grasp_height_offset: Ignored (for API compatibility)
         """
+        import torch
         self.model_path = model_path
-        self.device = device
-        self.voxel_size = voxel_size
+        self.device = torch.device(device if torch.cuda.is_available() else "cpu")
+        self.tsdf_size = tsdf_size
+        self.resolution = resolution
         self.score_threshold = score_threshold
 
         self.model = None
+        self._model_loaded = False
+
+        # Precompute query positions for implicit function
+        self._init_query_positions()
+
         if model_path:
             self._load_model(model_path)
 
-    def _load_model(self, model_path: str):
-        """Load GIGA model from checkpoint.
+    def _init_query_positions(self):
+        """Initialize query positions for grasp prediction."""
+        import torch
+        x, y, z = torch.meshgrid(
+            torch.linspace(-0.5, 0.5 - 1.0/self.resolution, self.resolution),
+            torch.linspace(-0.5, 0.5 - 1.0/self.resolution, self.resolution),
+            torch.linspace(-0.5, 0.5 - 1.0/self.resolution, self.resolution),
+            indexing='ij'
+        )
+        pos = torch.stack((x, y, z), dim=-1).float().unsqueeze(0)
+        self.query_positions = pos.view(1, self.resolution**3, 3).to(self.device)
 
-        Note: GIGA model loading is not yet implemented.
-        This selector will fall back to heuristic grasp selection.
-        """
-        # GIGA model loading would go here when implemented:
-        # self.model = GIGANet.load(model_path)
-        # self.model.to(self.device)
-        # self.model.eval()
-        print(f"[GIGAGraspSelector] Model loading not implemented: {model_path}")
+    def _load_model(self, model_path: str):
+        """Load VGN/GIGA model from checkpoint."""
+        import torch
+        import torch.nn as nn
+        import torch.nn.functional as F
+        from pathlib import Path
+
+        path = Path(model_path)
+        if not path.exists():
+            print(f"[GIGAGraspSelector] Model not found: {model_path}")
+            return
+
+        try:
+            # Define VGN network architecture inline (avoids torch_scatter dependency)
+            def conv(in_ch, out_ch, k):
+                return nn.Conv3d(in_ch, out_ch, k, padding=k//2)
+
+            def conv_stride(in_ch, out_ch, k):
+                return nn.Conv3d(in_ch, out_ch, k, stride=2, padding=k//2)
+
+            class Encoder(nn.Module):
+                def __init__(self):
+                    super().__init__()
+                    self.conv1 = conv_stride(1, 16, 5)
+                    self.conv2 = conv_stride(16, 32, 3)
+                    self.conv3 = conv_stride(32, 64, 3)
+
+                def forward(self, x):
+                    x = F.relu(self.conv1(x))
+                    x = F.relu(self.conv2(x))
+                    x = F.relu(self.conv3(x))
+                    return x
+
+            class Decoder(nn.Module):
+                def __init__(self):
+                    super().__init__()
+                    self.conv1 = conv(64, 64, 3)
+                    self.conv2 = conv(64, 32, 3)
+                    self.conv3 = conv(32, 16, 5)
+
+                def forward(self, x):
+                    x = F.relu(self.conv1(x))
+                    x = F.interpolate(x, 10)
+                    x = F.relu(self.conv2(x))
+                    x = F.interpolate(x, 20)
+                    x = F.relu(self.conv3(x))
+                    x = F.interpolate(x, 40)
+                    return x
+
+            class VGNNet(nn.Module):
+                def __init__(self):
+                    super().__init__()
+                    self.encoder = Encoder()
+                    self.decoder = Decoder()
+                    self.conv_qual = conv(16, 1, 5)
+                    self.conv_rot = conv(16, 4, 5)
+                    self.conv_width = conv(16, 1, 5)
+
+                def forward(self, x, pos=None):
+                    x = self.encoder(x)
+                    x = self.decoder(x)
+                    qual = torch.sigmoid(self.conv_qual(x))
+                    rot = F.normalize(self.conv_rot(x), dim=1)
+                    width = self.conv_width(x)
+                    return qual, rot, width
+
+            self.model = VGNNet().to(self.device)
+            state_dict = torch.load(model_path, map_location=self.device)
+            self.model.load_state_dict(state_dict)
+            self.model.eval()
+            self._model_loaded = True
+            print(f"[GIGAGraspSelector] VGN model loaded from {model_path}")
+
+        except Exception as e:
+            print(f"[GIGAGraspSelector] Failed to load model: {e}")
+            self._model_loaded = False
 
     def select_grasp(
         self,
@@ -386,47 +485,90 @@ class GIGAGraspSelector(GraspSelector):
         rgb_image: Optional[np.ndarray] = None,
         depth_image: Optional[np.ndarray] = None,
         camera_intrinsics: Optional[np.ndarray] = None,
+        camera_extrinsics: Optional[np.ndarray] = None,
+        segmentation_mask: Optional[np.ndarray] = None,
         approach_strategy: str = "top_down",
         **kwargs,
     ) -> Tuple[GraspPose, Dict[str, Any]]:
-        """Select grasp using GIGA model.
+        """Select grasp using GIGA/VGN model.
 
-        Requires point_cloud or (depth_image + camera_intrinsics).
-        Falls back to heuristic if model not loaded or inputs missing.
+        Args:
+            obj_pose: Object pose [x, y, z, qw, qx, qy, qz]
+            obj_name: Object name
+            depth_image: Depth image in meters
+            camera_intrinsics: Camera K matrix (3x3)
+            camera_extrinsics: Camera pose in world frame (4x4)
+            segmentation_mask: Optional mask to focus on target object
+
+        Returns:
+            Tuple of (GraspPose, info_dict)
         """
-        info = {"method": "giga", "fallback": False}
+        info = {"method": "giga", "fallback": False, "model_loaded": self._model_loaded}
 
-        # Check if we can run GIGA
-        if self.model is None:
+        # Check if model is loaded
+        if not self._model_loaded:
             info["fallback"] = True
             info["fallback_reason"] = "model_not_loaded"
             return self._fallback_heuristic(obj_pose, obj_name, approach_strategy, info)
 
-        if point_cloud is None:
-            if depth_image is not None and camera_intrinsics is not None:
-                point_cloud = self._depth_to_pointcloud(depth_image, camera_intrinsics)
-            else:
-                info["fallback"] = True
-                info["fallback_reason"] = "no_point_cloud"
-                return self._fallback_heuristic(obj_pose, obj_name, approach_strategy, info)
+        # Need depth and camera params for TSDF
+        if depth_image is None or camera_intrinsics is None:
+            info["fallback"] = True
+            info["fallback_reason"] = "no_depth_or_intrinsics"
+            return self._fallback_heuristic(obj_pose, obj_name, approach_strategy, info)
 
-        # Run GIGA inference
         try:
-            grasps = self._run_giga_inference(point_cloud)
+            # Create TSDF centered on object
+            tsdf_vol = self._create_tsdf(
+                depth_image, camera_intrinsics, camera_extrinsics,
+                center=obj_pose[:3], mask=segmentation_mask
+            )
+            info["tsdf_created"] = True
+
+            # Run VGN inference
+            grasps, scores = self._run_inference(tsdf_vol, obj_pose[:3])
+            info["n_candidates_raw"] = len(grasps)
+
             if len(grasps) == 0:
                 info["fallback"] = True
                 info["fallback_reason"] = "no_grasps_found"
                 return self._fallback_heuristic(obj_pose, obj_name, approach_strategy, info)
 
-            # Return best grasp
-            best_grasp = grasps[0]
-            info["n_candidates"] = len(grasps)
-            info["best_score"] = best_grasp.confidence
-            return best_grasp, info
+            # Filter by score
+            valid_grasps = [(g, s) for g, s in zip(grasps, scores) if s >= self.score_threshold]
+            info["n_candidates_filtered"] = len(valid_grasps)
+
+            if len(valid_grasps) == 0:
+                info["fallback"] = True
+                info["fallback_reason"] = f"no_grasps_above_threshold ({self.score_threshold})"
+                return self._fallback_heuristic(obj_pose, obj_name, approach_strategy, info)
+
+            # Sort by score and take best
+            valid_grasps.sort(key=lambda x: x[1], reverse=True)
+            best_grasp, best_score = valid_grasps[0]
+
+            info["best_score"] = float(best_score)
+            info["n_candidates"] = len(valid_grasps)
+
+            # Default orientation (gripper down) for robosuite compatibility
+            default_orientation = np.array([-0.02, 0.707, 0.707, -0.02])
+
+            grasp_pose = GraspPose(
+                position=best_grasp["position"],
+                orientation=default_orientation,  # Use safe orientation
+                gripper_width=best_grasp["width"],
+                confidence=best_score,
+                strategy="giga",
+                metadata={"original_orientation": best_grasp["orientation"].tolist()},
+            )
+
+            return grasp_pose, info
 
         except Exception as e:
             info["fallback"] = True
             info["fallback_reason"] = f"inference_error: {e}"
+            import traceback
+            traceback.print_exc()
             return self._fallback_heuristic(obj_pose, obj_name, approach_strategy, info)
 
     def select_multiple_grasps(
@@ -437,48 +579,214 @@ class GIGAGraspSelector(GraspSelector):
         **kwargs,
     ) -> List[Tuple[GraspPose, Dict[str, Any]]]:
         """Select multiple grasp candidates from GIGA."""
-        # For now, just return variations from single grasp
         primary, info = self.select_grasp(obj_pose, obj_name, **kwargs)
 
         if info.get("fallback"):
-            # Use heuristic fallback for multiple grasps
             heuristic = HeuristicGraspSelector()
             return heuristic.select_multiple_grasps(obj_pose, obj_name, n_grasps, **kwargs)
 
-        # TODO: Implement full GIGA multi-grasp selection
         return [(primary, info)]
 
-    def _run_giga_inference(self, point_cloud: np.ndarray) -> List[GraspPose]:
-        """Run GIGA inference on point cloud.
-
-        This is a stub - actual implementation would:
-        1. Voxelize point cloud
-        2. Run through GIGA network
-        3. Extract top-k grasp poses
-        4. Transform to world frame
-        """
-        # Placeholder - return empty list to trigger fallback
-        return []
-
-    def _depth_to_pointcloud(
+    def _create_tsdf(
         self,
         depth_image: np.ndarray,
         camera_intrinsics: np.ndarray,
+        camera_extrinsics: Optional[np.ndarray],
+        center: np.ndarray,
+        mask: Optional[np.ndarray] = None,
     ) -> np.ndarray:
-        """Convert depth image to point cloud."""
-        # Standard depth -> pointcloud conversion
-        h, w = depth_image.shape
+        """Create TSDF volume from depth image using point cloud projection.
+
+        Uses a simplified TSDF construction that projects depth points into
+        a voxel grid and computes signed distances. More stable than open3d's
+        TSDF integration which can segfault.
+
+        Args:
+            depth_image: Depth in meters (H, W)
+            camera_intrinsics: K matrix (3, 3)
+            camera_extrinsics: T_world_camera (4, 4)
+            center: World position to center TSDF on
+            mask: Optional segmentation mask
+
+        Returns:
+            TSDF grid (1, resolution, resolution, resolution)
+        """
+        from scipy import ndimage
+
+        # Handle depth shape
+        if depth_image.ndim == 3:
+            depth_image = depth_image[:, :, 0]
+
+        # Apply mask if provided
+        if mask is not None:
+            if mask.ndim == 3:
+                mask = mask[:, :, 0]
+            depth_masked = depth_image.copy()
+            depth_masked[mask == 0] = 0
+        else:
+            depth_masked = depth_image
+
+        h, w = depth_masked.shape
         fx, fy = camera_intrinsics[0, 0], camera_intrinsics[1, 1]
         cx, cy = camera_intrinsics[0, 2], camera_intrinsics[1, 2]
 
+        # Deproject depth to 3D points in camera frame
         u, v = np.meshgrid(np.arange(w), np.arange(h))
-        z = depth_image
+        z = depth_masked
+        valid = z > 0.1  # Minimum valid depth
+
         x = (u - cx) * z / fx
         y = (v - cy) * z / fy
 
-        points = np.stack([x, y, z], axis=-1).reshape(-1, 3)
-        valid = z.flatten() > 0
-        return points[valid]
+        # Stack to get camera-frame points
+        points_cam = np.stack([x, y, z], axis=-1)  # (H, W, 3)
+
+        # Transform to world frame
+        if camera_extrinsics is not None:
+            T = camera_extrinsics
+            R = T[:3, :3]
+            t = T[:3, 3]
+            points_world = points_cam @ R.T + t
+        else:
+            points_world = points_cam
+
+        # Get valid points
+        valid_points = points_world[valid]  # (N, 3)
+
+        if len(valid_points) < 10:
+            # Not enough points, return empty TSDF
+            return np.ones((1, self.resolution, self.resolution, self.resolution), dtype=np.float32)
+
+        # Create voxel grid centered on object
+        voxel_size = self.tsdf_size / self.resolution
+        half_size = self.tsdf_size / 2
+
+        # TSDF grid origin (corner of volume in world frame)
+        origin = center - np.array([half_size, half_size, half_size])
+
+        # Initialize TSDF with truncation distance
+        trunc = 4 * voxel_size
+        tsdf_grid = np.ones((self.resolution, self.resolution, self.resolution), dtype=np.float32) * trunc
+
+        # Convert valid points to voxel coordinates
+        voxel_coords = ((valid_points - origin) / voxel_size).astype(np.int32)
+
+        # Clip to valid range
+        valid_voxel = np.all(
+            (voxel_coords >= 0) & (voxel_coords < self.resolution),
+            axis=1
+        )
+        voxel_coords = voxel_coords[valid_voxel]
+        valid_points = valid_points[valid_voxel]
+
+        # Mark occupied voxels (surface at 0, inside negative, outside positive)
+        # For each point, set the voxel it's in to 0 (on surface)
+        for idx in range(len(voxel_coords)):
+            i, j, k = voxel_coords[idx]
+            tsdf_grid[i, j, k] = 0.0
+
+        # Propagate signed distance using distance transform
+        # Inside (negative): use distance from surface with negative sign
+        # Outside (positive): use distance from surface with positive sign
+        occupied = tsdf_grid == 0.0
+        if occupied.any():
+            # Distance transform gives distance to nearest occupied voxel
+            dist_to_surface = ndimage.distance_transform_edt(~occupied) * voxel_size
+
+            # Clip to truncation distance and normalize
+            tsdf_grid = np.minimum(dist_to_surface, trunc) / trunc
+
+            # Mark interior (heuristic: voxels "below" the surface in z)
+            # This is approximate but works for tabletop scenes
+            for idx in range(len(voxel_coords)):
+                i, j, k = voxel_coords[idx]
+                # Mark voxels below the surface point as inside (negative)
+                for kk in range(k + 1, self.resolution):
+                    if tsdf_grid[i, j, kk] > 0:
+                        tsdf_grid[i, j, kk] = -tsdf_grid[i, j, kk]
+
+        return tsdf_grid.reshape(1, self.resolution, self.resolution, self.resolution)
+
+    def _run_inference(
+        self,
+        tsdf_vol: np.ndarray,
+        center: np.ndarray,
+    ) -> Tuple[List[Dict], List[float]]:
+        """Run VGN inference on TSDF volume.
+
+        Args:
+            tsdf_vol: TSDF grid (1, 40, 40, 40)
+            center: World position of TSDF center
+
+        Returns:
+            List of grasp dicts and scores
+        """
+        import torch
+        from scipy import ndimage
+        from scipy.spatial.transform import Rotation as R
+
+        # Convert to tensor (ensure float32)
+        tsdf_tensor = torch.from_numpy(tsdf_vol.astype(np.float32)).unsqueeze(0).to(self.device)  # (1, 1, 40, 40, 40)
+
+        # Forward pass
+        with torch.no_grad():
+            qual_vol, rot_vol, width_vol = self.model(tsdf_tensor)
+
+        # Move to CPU
+        qual_vol = qual_vol.cpu().squeeze().numpy()  # (40, 40, 40)
+        rot_vol = rot_vol.cpu().squeeze().numpy()  # (4, 40, 40, 40) -> need (40, 40, 40, 4)
+        rot_vol = np.transpose(rot_vol, (1, 2, 3, 0))
+        width_vol = width_vol.cpu().squeeze().numpy()  # (40, 40, 40)
+
+        # Post-process quality volume
+        # Smooth with Gaussian
+        qual_vol = ndimage.gaussian_filter(qual_vol, sigma=1.0, mode="nearest")
+
+        # Mask out invalid regions (far from surface)
+        tsdf_np = tsdf_vol.squeeze()
+        outside = tsdf_np > 0.5
+        inside = np.logical_and(1e-3 < tsdf_np, tsdf_np < 0.5)
+        valid = ndimage.binary_dilation(outside, iterations=2, mask=~inside)
+        qual_vol[~valid] = 0.0
+
+        # Apply score threshold
+        qual_vol[qual_vol < 0.5] = 0.0
+
+        # Non-maximum suppression
+        max_vol = ndimage.maximum_filter(qual_vol, size=4)
+        qual_vol = np.where(qual_vol == max_vol, qual_vol, 0.0)
+
+        # Extract grasps
+        grasps = []
+        scores = []
+        voxel_size = self.tsdf_size / self.resolution
+
+        for idx in np.argwhere(qual_vol > 0):
+            i, j, k = idx
+            score = qual_vol[i, j, k]
+
+            # Voxel position in TSDF frame (centered at origin)
+            pos_tsdf = (np.array([i, j, k]) + 0.5) * voxel_size - self.tsdf_size / 2
+
+            # Transform to world frame
+            pos_world = pos_tsdf + center
+
+            # Orientation (quaternion)
+            quat = rot_vol[i, j, k]  # [x, y, z, w] or [w, x, y, z]?
+            # VGN uses scipy convention [x, y, z, w]
+            orientation = np.array([quat[3], quat[0], quat[1], quat[2]])  # Convert to [w, x, y, z]
+
+            # Gripper width
+            width = float(width_vol[i, j, k]) * self.tsdf_size
+
+            grasps.append({
+                "position": pos_world,
+                "orientation": orientation,
+                "width": np.clip(width, 0.033, 0.10),  # Clamp to valid range
+            })
+            scores.append(float(score))
+
+        return grasps, scores
 
     def _fallback_heuristic(
         self,
@@ -659,15 +967,9 @@ class ContactGraspNetSelector(GraspSelector):
             info["fallback_reason"] = self._load_error or "model_not_loaded"
             return self._fallback_heuristic(obj_pose, obj_name, approach_strategy, info)
 
-        # Early check: hollow objects are better handled by heuristic rim-grasp
-        # Do this BEFORE expensive point cloud generation and inference
-        obj_name_lower = obj_name.lower()
-        is_hollow = any(hollow in obj_name_lower for hollow in ['bowl', 'mug', 'cup', 'ramekin'])
-
-        if is_hollow:
-            info["fallback"] = True
-            info["fallback_reason"] = f"hollow_object_fallback ({obj_name})"
-            return self._fallback_heuristic(obj_pose, obj_name, approach_strategy, info)
+        # NOTE: Removed hollow object fallback to allow CGN to handle all objects.
+        # CGN can predict grasps for hollow objects (bowls, mugs) too.
+        # The previous fallback was preventing CGN from ever running on bowl tasks.
 
         # Get or create point cloud
         if point_cloud is None:
@@ -698,15 +1000,19 @@ class ContactGraspNetSelector(GraspSelector):
 
             # Filter grasps by proximity to target object
             # CGN returns grasps for the entire scene, so we filter to target
-            # Using tight 8cm threshold to ensure grasps are on the object itself
+            # Using 15cm threshold - CGN grasps can be offset from object center
             obj_position = obj_pose[:3]
-            max_grasp_distance = 0.08  # 8cm max from object center (tightened from 15cm)
+            max_grasp_distance = 0.15  # 15cm max from object center
 
             filtered_grasps = []
             for g in grasps:
                 dist = np.linalg.norm(g["position"] - obj_position)
                 if dist <= max_grasp_distance:
                     g["distance_to_object"] = dist
+                    # Prefer grasps on the near side of the object (Y < object Y)
+                    # Robot is at Y- so grasps with lower Y are more reachable
+                    y_bias = obj_position[1] - g["position"][1]  # Positive if grasp is toward robot
+                    g["reachability_score"] = y_bias  # Higher = better
                     filtered_grasps.append(g)
 
             info["n_candidates_raw"] = len(grasps)
@@ -717,8 +1023,53 @@ class ContactGraspNetSelector(GraspSelector):
                 info["fallback_reason"] = f"no_grasps_near_object (closest: {min(np.linalg.norm(g['position'] - obj_position) for g in grasps):.3f}m)"
                 return self._fallback_heuristic(obj_pose, obj_name, approach_strategy, info)
 
-            # Re-sort by score (already sorted, but just in case)
-            filtered_grasps.sort(key=lambda g: g["score"], reverse=True)
+            # Filter for near-vertical approach directions (for top_down strategy)
+            # The robosuite controller works best with grasps that approach from above
+            # Approach direction should have negative Z component (pointing down)
+            if approach_strategy == "top_down":
+                vertical_grasps = []
+                for g in filtered_grasps:
+                    # Get approach direction from rotation matrix (Z-axis)
+                    if "orientation" in g and g["orientation"] is not None:
+                        rot = g["orientation"]
+                        if rot.shape == (3, 3):
+                            approach_dir = rot[:, 2]  # Z-axis of gripper
+                        else:
+                            # Quaternion - convert to rotation matrix
+                            from scipy.spatial.transform import Rotation as R
+                            quat = rot
+                            if len(quat) == 4:
+                                r = R.from_quat(quat)  # Assumes [x,y,z,w]
+                                approach_dir = r.as_matrix()[:, 2]
+                            else:
+                                approach_dir = np.array([0, 0, -1])
+                    else:
+                        approach_dir = np.array([0, 0, -1])
+
+                    # Check if approach is roughly downward (Z < -0.3)
+                    # or roughly horizontal toward the robot (Y > 0.5 for front grasps)
+                    is_downward = approach_dir[2] < -0.3
+                    is_front_approach = approach_dir[1] > 0.5
+
+                    if is_downward or is_front_approach:
+                        g["approach_direction"] = approach_dir
+                        vertical_grasps.append(g)
+
+                info["n_vertical_filtered"] = len(vertical_grasps)
+
+                if len(vertical_grasps) > 0:
+                    filtered_grasps = vertical_grasps
+
+            # Sort by combined score: grasp quality + reachability bias
+            # Normalize reachability to [0, 1] range and add to score
+            # This biases toward grasps on the near side of the object
+            for g in filtered_grasps:
+                reach = g.get("reachability_score", 0)
+                # Clamp and normalize reachability to [0, 0.3] bonus
+                reach_bonus = min(0.3, max(0, reach * 5))  # 5cm offset = 0.25 bonus
+                g["combined_score"] = g["score"] + reach_bonus
+
+            filtered_grasps.sort(key=lambda g: g["combined_score"], reverse=True)
             grasps = filtered_grasps
 
             # Convert best grasp to GraspPose
@@ -727,14 +1078,52 @@ class ContactGraspNetSelector(GraspSelector):
             info["best_score"] = float(best_grasp["score"])
             info["best_grasp_distance"] = float(best_grasp["distance_to_object"])
 
+            # Use CGN position but apply heuristic orientation for robosuite compatibility
+            # The robosuite OSC controller expects a specific gripper orientation
+            # CGN orientations often don't work well with the controller
+            default_orientation = np.array([-0.02, 0.707, 0.707, -0.02])  # [w,x,y,z] gripper-down
+
+            # Get grasp position
+            grasp_position = best_grasp["position"].copy()
+
+            # For hollow objects, use heuristic rim-grasp position since CGN
+            # often selects grasps that are too far from the object center
+            # The heuristic rim-grasp works well for small tabletop objects
+            obj_name_lower = obj_name.lower()
+            is_hollow = any(h in obj_name_lower for h in ['bowl', 'mug', 'cup', 'ramekin'])
+            if is_hollow and approach_strategy == "top_down":
+                # Use heuristic position (rim offset toward robot)
+                # Object radii for hollow objects
+                OBJECT_RADII = {
+                    'bowl': 0.045, 'mug': 0.035, 'cup': 0.035, 'ramekin': 0.030
+                }
+                # Find matching object type
+                obj_radius = 0.04  # default
+                for obj_type, radius in OBJECT_RADII.items():
+                    if obj_type in obj_name_lower:
+                        obj_radius = radius
+                        break
+
+                # Place grasp on rim, offset toward robot (Y-)
+                grasp_position[0] = obj_pose[0]  # Keep X centered
+                grasp_position[1] = obj_pose[1] - obj_radius  # Offset toward robot
+                grasp_position[2] = obj_pose[2] + 0.04  # Rim height
+                info["position_adjusted"] = True
+                info["adjustment_reason"] = "hollow_object_rim_grasp"
+                # Use "rim" strategy to trigger heuristic code path in grasp.py
+                # This avoids orientation oscillation from learned grasp code
+                grasp_strategy = "rim"
+            else:
+                grasp_strategy = "contact_graspnet"
+
             grasp_pose = GraspPose(
-                position=best_grasp["position"],
-                orientation=best_grasp["orientation"],
+                position=grasp_position,
+                orientation=default_orientation,  # Use heuristic orientation
                 gripper_width=best_grasp.get("width", 0.04),
                 confidence=best_grasp["score"],
-                approach_direction=best_grasp.get("approach", None),
-                strategy="contact_graspnet",
-                metadata={"grasp_index": 0},
+                approach_direction=best_grasp.get("approach_direction", None),
+                strategy=grasp_strategy,
+                metadata={"grasp_index": 0, "original_orientation": best_grasp["orientation"].tolist() if hasattr(best_grasp["orientation"], "tolist") else best_grasp["orientation"]},
             )
 
             return grasp_pose, info

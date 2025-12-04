@@ -123,8 +123,14 @@ def extract_expected_classes(task_description: str) -> tuple:
     """
     task_lower = task_description.lower()
 
-    # Known object classes
-    OBJECT_CLASSES = ['bowl', 'plate', 'mug', 'ramekin', 'drawer', 'cabinet', 'cookie_box', 'can', 'bottle', 'stove']
+    # Known object classes (including libero_object grocery items)
+    OBJECT_CLASSES = [
+        # Kitchen objects
+        'bowl', 'plate', 'mug', 'ramekin', 'drawer', 'cabinet', 'cookie_box', 'can', 'bottle', 'stove',
+        # Grocery items (libero_object)
+        'alphabet_soup', 'cream_cheese', 'salad_dressing', 'bbq_sauce', 'ketchup',
+        'tomato_sauce', 'butter', 'milk', 'chocolate_pudding', 'orange_juice', 'basket',
+    ]
 
     expected_source = None
     expected_target = None
@@ -135,8 +141,11 @@ def extract_expected_classes(task_description: str) -> tuple:
         if kw in task_lower:
             rest = task_lower.split(kw)[1]
             words = rest.split()[:5]  # Look at first 5 words
+            rest_text = ' '.join(words)
             for cls in OBJECT_CLASSES:
-                if cls in ' '.join(words):
+                # Handle underscores in class names (e.g., chocolate_pudding -> chocolate pudding)
+                cls_spaced = cls.replace('_', ' ')
+                if cls_spaced in rest_text or cls in rest_text:
                     expected_source = cls
                     break
             break
@@ -148,8 +157,11 @@ def extract_expected_classes(task_description: str) -> tuple:
         if kw in task_lower:
             rest = task_lower.split(kw)[-1]
             words = rest.split()[:5]
+            rest_text = ' '.join(words)
             for cls in OBJECT_CLASSES:
-                if cls in ' '.join(words):
+                # Handle underscores in class names
+                cls_spaced = cls.replace('_', ' ')
+                if cls_spaced in rest_text or cls in rest_text:
                     expected_target = cls
                     break
             break
@@ -165,7 +177,13 @@ def get_object_class(obj_id: str) -> str:
     obj_lower = obj_id.lower()
 
     # Check for known classes in order (more specific first)
-    OBJECT_CLASSES = ['cookie_box', 'ramekin', 'cabinet', 'drawer', 'bottle', 'stove', 'bowl', 'plate', 'mug', 'can']
+    OBJECT_CLASSES = [
+        # Kitchen objects
+        'cookie_box', 'ramekin', 'cabinet', 'drawer', 'bottle', 'stove', 'bowl', 'plate', 'mug', 'can',
+        # Grocery items (libero_object)
+        'alphabet_soup', 'cream_cheese', 'salad_dressing', 'bbq_sauce', 'ketchup',
+        'tomato_sauce', 'butter', 'milk', 'chocolate_pudding', 'orange_juice', 'basket',
+    ]
     for cls in OBJECT_CLASSES:
         if cls in obj_lower:
             return cls
@@ -211,6 +229,39 @@ def parse_task_for_grounding(task_description: str, object_names: list) -> tuple
                 object_types.setdefault('stove', []).append(obj_id)  # Burner as fallback
         if 'bottle' in obj_lower:
             object_types.setdefault('bottle', []).append(obj_id)
+        # Grocery items (libero_object tasks)
+        if 'basket' in obj_lower:
+            object_types.setdefault('basket', []).append(obj_id)
+        if 'alphabet_soup' in obj_lower or 'alphabet soup' in obj_lower:
+            object_types.setdefault('alphabet soup', []).append(obj_id)
+            object_types.setdefault('alphabet_soup', []).append(obj_id)
+        if 'salad_dressing' in obj_lower or 'salad dressing' in obj_lower:
+            object_types.setdefault('salad dressing', []).append(obj_id)
+            object_types.setdefault('salad_dressing', []).append(obj_id)
+        if 'bbq_sauce' in obj_lower or 'bbq sauce' in obj_lower:
+            object_types.setdefault('bbq sauce', []).append(obj_id)
+            object_types.setdefault('bbq_sauce', []).append(obj_id)
+        if 'ketchup' in obj_lower:
+            object_types.setdefault('ketchup', []).append(obj_id)
+        if 'tomato_sauce' in obj_lower or 'tomato sauce' in obj_lower:
+            object_types.setdefault('tomato sauce', []).append(obj_id)
+            object_types.setdefault('tomato_sauce', []).append(obj_id)
+        if 'cream_cheese' in obj_lower or 'cream cheese' in obj_lower:
+            object_types.setdefault('cream cheese', []).append(obj_id)
+            object_types.setdefault('cream_cheese', []).append(obj_id)
+        if 'butter' in obj_lower:
+            object_types.setdefault('butter', []).append(obj_id)
+        if 'milk' in obj_lower:
+            object_types.setdefault('milk', []).append(obj_id)
+        if 'chocolate_pudding' in obj_lower or 'chocolate pudding' in obj_lower:
+            object_types.setdefault('chocolate pudding', []).append(obj_id)
+            object_types.setdefault('chocolate_pudding', []).append(obj_id)
+        if 'orange_juice' in obj_lower or 'orange juice' in obj_lower:
+            object_types.setdefault('orange juice', []).append(obj_id)
+            object_types.setdefault('orange_juice', []).append(obj_id)
+        if 'wine_bottle' in obj_lower or 'wine bottle' in obj_lower:
+            object_types.setdefault('wine bottle', []).append(obj_id)
+            object_types.setdefault('wine_bottle', []).append(obj_id)
 
     source_obj = None
     target_obj = None
@@ -220,8 +271,12 @@ def parse_task_for_grounding(task_description: str, object_names: list) -> tuple
     for kw in source_keywords:
         if kw in task_lower:
             rest = task_lower.split(kw)[1]
+            # Extract first few words (up to "and" or end)
+            rest_words = rest.split()
+            rest_prefix = ' '.join(rest_words[:5])  # Take first 5 words for matching
             for obj_type, obj_list in object_types.items():
-                if obj_type in rest.split()[0:3]:
+                # Check if obj_type (e.g., "alphabet soup") is in the prefix
+                if obj_type in rest_prefix:
                     source_obj = obj_list[0]
                     break
             if source_obj:
@@ -261,8 +316,9 @@ def parse_task_for_grounding(task_description: str, object_names: list) -> tuple
 
             # Fallback to regular matching
             if not target_obj:
+                target_prefix = ' '.join(target_part.split()[:5])
                 for obj_type, obj_list in object_types.items():
-                    if obj_type in target_part.split()[0:3]:
+                    if obj_type in target_prefix:
                         target_obj = obj_list[0]
                         break
 
@@ -273,8 +329,9 @@ def parse_task_for_grounding(task_description: str, object_names: list) -> tuple
         for kw in target_keywords:
             if kw in task_lower:
                 rest = task_lower.split(kw)[-1]
+                rest_prefix = ' '.join(rest.split()[:5])
                 for obj_type, obj_list in object_types.items():
-                    if obj_type in rest.split()[0:3]:
+                    if obj_type in rest_prefix:
                         target_obj = obj_list[0]
                         break
                 if target_obj:
@@ -705,7 +762,9 @@ def main():
     parser.add_argument("--bootstrap", type=str, choices=["oracle", "cold"], default="oracle",
                         help="Bootstrap mode for learned perception: oracle (use GT at t=0) or cold (detection only)")
     parser.add_argument("--model-path", type=str, default="models/yolo_libero.pt",
-                        help="Path to YOLO model (only used with --perception learned)")
+                        help="Path to YOLO model (only used with --perception learned --detector yolo)")
+    parser.add_argument("--detector", type=str, choices=["yolo", "gdino", "gsam"], default="yolo",
+                        help="Detector type: yolo (trained), gdino (open-vocab), gsam (open-vocab + masks)")
     parser.add_argument("--task-suite", type=str, default="libero_spatial")
     parser.add_argument("--task-id", type=int, default=0)
     parser.add_argument("--n-episodes", type=int, default=20)
@@ -715,8 +774,8 @@ def main():
                         help="Grasp selector: heuristic (rule-based) or contact_graspnet (learned 6-DoF)")
     args = parser.parse_args()
 
-    # Validate model path for learned perception
-    if args.perception == "learned" and not Path(args.model_path).exists():
+    # Validate model path for learned perception with YOLO
+    if args.perception == "learned" and args.detector == "yolo" and not Path(args.model_path).exists():
         print(f"Error: YOLO model not found at {args.model_path}")
         print("Train a model first with: python scripts/train_yolo_detector.py")
         return 1
@@ -735,9 +794,10 @@ def main():
     # Setup output directory
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     perception_suffix = f"_{args.perception}" if args.perception != "oracle" else ""
+    detector_suffix = f"_{args.detector}" if args.perception == "learned" and args.detector != "yolo" else ""
     bootstrap_suffix = f"_{args.bootstrap}" if args.perception == "learned" and args.bootstrap != "oracle" else ""
     grasp_suffix = f"_{args.grasp_selector}" if args.grasp_selector != "heuristic" else ""
-    output_dir = Path(args.output_dir) / f"{args.mode}{perception_suffix}{bootstrap_suffix}{grasp_suffix}_{timestamp}"
+    output_dir = Path(args.output_dir) / f"{args.mode}{perception_suffix}{detector_suffix}{bootstrap_suffix}{grasp_suffix}_{timestamp}"
     output_dir.mkdir(parents=True, exist_ok=True)
 
     # Save config
@@ -745,8 +805,9 @@ def main():
         json.dump({
             "mode": args.mode,
             "perception": args.perception,
+            "detector": args.detector if args.perception == "learned" else None,
             "bootstrap": args.bootstrap if args.perception == "learned" else None,
-            "model_path": args.model_path if args.perception == "learned" else None,
+            "model_path": args.model_path if args.perception == "learned" and args.detector == "yolo" else None,
             "grasp_selector": args.grasp_selector,
             **config.to_dict()
         }, f, indent=2)
@@ -757,7 +818,11 @@ def main():
         "qwen_grounded": "Phase 3 (Qwen Grounding)",
     }
     phase_name = phase_names.get(args.mode, args.mode)
-    perception_name = "Learned (YOLO+Depth)" if args.perception == "learned" else "Oracle"
+    detector_names = {"yolo": "YOLO", "gdino": "Grounding-DINO", "gsam": "Grounded-SAM"}
+    if args.perception == "learned":
+        perception_name = f"Learned ({detector_names.get(args.detector, args.detector)}+Depth)"
+    else:
+        perception_name = "Oracle"
 
     print("=" * 60)
     print(f"Evaluation: {phase_name}")
@@ -766,7 +831,9 @@ def main():
     print(f"Perception: {perception_name}")
     print(f"Grasp Selector: {args.grasp_selector}")
     if args.perception == "learned":
-        print(f"Model: {args.model_path}")
+        print(f"Detector: {args.detector}")
+        if args.detector == "yolo":
+            print(f"Model: {args.model_path}")
         print(f"Bootstrap: {args.bootstrap}")
     print(f"Task Suite: {args.task_suite}")
     print(f"Task ID: {args.task_id}")
@@ -784,12 +851,30 @@ def main():
     oracle_perception = OraclePerception()  # Always need oracle for bootstrap/reference
 
     if args.perception == "learned":
+        # Extract target objects from task description for open-vocab detectors
+        target_objects = None
+        if args.detector in ["gdino", "gsam"]:
+            # Extract source/target from task for open-vocab detection
+            expected_source, expected_target = extract_expected_classes(task_description)
+            target_objects = []
+            if expected_source:
+                target_objects.append(expected_source)
+            if expected_target:
+                target_objects.append(expected_target)
+            # Add basket as common target for libero_object tasks
+            if "basket" not in target_objects:
+                target_objects.append("basket")
+            print(f"Target objects for open-vocab detector: {target_objects}")
+
         learned_perception = LearnedPerception(
             model_path=args.model_path,
-            confidence_threshold=0.5,
+            confidence_threshold=0.5 if args.detector == "yolo" else 0.35,
             image_size=(256, 256),
+            detector_type=args.detector,
+            target_objects=target_objects,
         )
-        print("Warming up YOLO detector...")
+        detector_name = {"yolo": "YOLO", "gdino": "Grounding-DINO", "gsam": "Grounded-SAM"}
+        print(f"Warming up {detector_name.get(args.detector, args.detector)} detector...")
         learned_perception.detector.warmup()
         perception = learned_perception
     else:

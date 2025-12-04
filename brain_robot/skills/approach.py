@@ -138,29 +138,40 @@ class ApproachSkill(Skill):
         if obj_name in world_state.objects:
             obj_type = world_state.objects[obj_name].object_type
 
-        # Check if object is inside a drawer/cabinet (using spatial relations)
-        # Objects INSIDE cabinets/drawers need horizontal approach to reach them
+        # Determine object context based on HEIGHT first, then spatial relations
+        # Height is more reliable than semantic "inside" relations which can be wrong
+        #
+        # Height thresholds:
+        # - z > 1.20: ON TOP of cabinet (very high) -> front_angled_steep
+        # - z > 1.05: On elevated surface (stove, etc) -> front_angled
+        # - z < 1.05 with "inside" relation: Actually inside drawer/cabinet -> front_horizontal
+
         in_drawer = False
         on_cabinet = False
-        if hasattr(world_state, 'inside') and world_state.inside and obj_name in world_state.inside:
-            container = world_state.inside[obj_name]
-            # Check for drawer OR cabinet - both require horizontal approach when inside
-            in_drawer = any(x in container.lower() for x in ['drawer', 'cabinet'])
-        # Fallback to name-based check
-        if not in_drawer:
-            in_drawer = 'drawer' in obj_name.lower() or (obj_type and 'drawer' in str(obj_type).lower())
+        on_elevated = obj_pose[2] > 1.05  # Above normal table height
 
-        # Check if object is ON TOP of a cabinet (high surface, far from robot)
-        # Cabinet tops are typically at z > 1.15 and require steep angled approach
-        if hasattr(world_state, 'on_top') and world_state.on_top and obj_name in world_state.on_top:
+        # Check if object is ON TOP of a cabinet (high surface)
+        # Cabinet tops are typically at z > 1.20
+        if obj_pose[2] > 1.20:
+            on_cabinet = True
+        elif hasattr(world_state, 'on_top') and world_state.on_top and obj_name in world_state.on_top:
             surface = world_state.on_top[obj_name]
             if 'cabinet' in surface.lower():
                 on_cabinet = True
-        # Fallback: high objects (z > 1.15) are likely on cabinet tops
-        if not on_cabinet and obj_pose[2] > 1.15:
-            on_cabinet = True
 
-        on_elevated = obj_pose[2] > 1.05  # Above normal table height
+        # Check if object is INSIDE a drawer/cabinet (only if NOT on top)
+        # Objects truly inside cabinets are at lower heights (z < 1.20)
+        if not on_cabinet:
+            if hasattr(world_state, 'inside') and world_state.inside and obj_name in world_state.inside:
+                container = world_state.inside[obj_name]
+                # Check for drawer OR cabinet - but only if height suggests inside
+                if any(x in container.lower() for x in ['drawer', 'cabinet']):
+                    # Sanity check: objects inside drawers/cabinets should be below 1.20
+                    if obj_pose[2] < 1.20:
+                        in_drawer = True
+            # Fallback to name-based check
+            if not in_drawer:
+                in_drawer = 'drawer' in obj_name.lower() or (obj_type and 'drawer' in str(obj_type).lower())
 
         # Select optimal approach strategy based on object position
         strategy_name, approach_dir, gripper_ori = select_approach_strategy(

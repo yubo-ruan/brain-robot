@@ -49,6 +49,10 @@ class NearestNeighborTracker(TrackerInterface):
     # Default association threshold (meters) - objects closer than this match
     association_threshold: float = 0.10
 
+    # If True, don't update track positions from detections - only use for matching
+    # Useful when detection 3D positions are inaccurate but bootstrap positions are good
+    preserve_bootstrap_positions: bool = False
+
     # Class-specific association thresholds based on object dimensions
     # Smaller objects need tighter thresholds to avoid mis-associations
     CLASS_ASSOCIATION_THRESHOLDS: Dict[str, float] = field(default_factory=lambda: {
@@ -184,10 +188,13 @@ class NearestNeighborTracker(TrackerInterface):
                 if best_track is not None:
                     # Update matched track
                     dt = timestamp - best_track.last_seen
-                    if dt > 0:
-                        best_track.velocity = (detection.position - best_track.position) / dt
 
-                    best_track.position = detection.position.copy()
+                    # Only update position/velocity if not preserving bootstrap positions
+                    if not self.preserve_bootstrap_positions:
+                        if dt > 0:
+                            best_track.velocity = (detection.position - best_track.position) / dt
+                        best_track.position = detection.position.copy()
+
                     best_track.confidence = min(1.0, best_track.confidence + 0.1)
                     best_track.hits += 1
                     best_track.misses = 0

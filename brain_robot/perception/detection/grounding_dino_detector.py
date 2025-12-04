@@ -140,14 +140,23 @@ class GroundingDINODetector(ObjectDetector):
 
         Args:
             object_names: List of object names (e.g., ["bbq_sauce", "cream_cheese"])
+                         Accepts both underscore and space versions (e.g., "alphabet_soup" or "alphabet soup")
         """
         prompts = []
         for name in object_names:
+            # Normalize: try both underscore and space versions
+            name_underscore = name.replace(" ", "_")
+            name_space = name.replace("_", " ")
+
             if name in self.object_prompts:
                 prompts.append(self.object_prompts[name])
+            elif name_underscore in self.object_prompts:
+                prompts.append(self.object_prompts[name_underscore])
+            elif name_space in self.object_prompts:
+                prompts.append(self.object_prompts[name_space])
             else:
                 # Fallback to object name with underscores replaced
-                prompts.append(name.replace("_", " "))
+                prompts.append(name_space)
 
         self._prompt = ". ".join(prompts) + "."
 
