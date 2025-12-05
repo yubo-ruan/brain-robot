@@ -9,8 +9,8 @@ Brain-inspired LLM-guided robot control for LIBERO benchmark.
 git clone https://github.com/yubo-ruan/brain-robot.git
 cd brain-robot
 
-# Install dependencies
-pip install torch torchvision transformers accelerate gymnasium numpy huggingface_hub
+# Install dependencies (includes LIBERO)
+pip install -r requirements.txt
 
 # Download Qwen2.5-VL-7B model (~16GB, required for VLM features)
 python scripts/download_models.py

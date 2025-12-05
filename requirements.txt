@@ -8,5 +8,5 @@ pyyaml>=6.0
 wandb>=0.16.0
 tqdm>=4.65.0
 qwen-vl-utils
-# LIBERO (install separately)
-# pip install libero
+huggingface_hub
+libero
