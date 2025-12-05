@@ -18,7 +18,7 @@ def test_vlm_planner():
     print("Testing VLM Planner (Qwen2.5-VL-7B)")
     print("="*60)
 
-    from brain_robot.vlm.qwen_planner import QwenVLPlanner
+    from src.vlm.qwen_planner import QwenVLPlanner
 
     # Create a simple test image (random colored image simulating a robot scene)
     print("\nCreating test image...")
@@ -31,7 +31,7 @@ def test_vlm_planner():
     # Initialize planner
     print("\nLoading Qwen2.5-VL planner...")
     planner = QwenVLPlanner(
-        model_name="/workspace/brain_robot/models/qwen2.5-vl-7b",
+        model_name="/workspace/src/models/qwen2.5-vl-7b",
         device="cuda:0",
         max_new_tokens=512,
         temperature=0.1,
@@ -66,8 +66,8 @@ def test_full_pipeline():
     print("Testing Full Pipeline: VLM → Action Generator")
     print("="*60)
 
-    from brain_robot.vlm.qwen_planner import QwenVLPlanner
-    from brain_robot.action_generator.brain_model import BrainInspiredActionGenerator
+    from src.vlm.qwen_planner import QwenVLPlanner
+    from src.action_generator.brain_model import BrainInspiredActionGenerator
 
     # Create test image
     test_image = np.random.randint(0, 255, (256, 256, 3), dtype=np.uint8)
@@ -75,7 +75,7 @@ def test_full_pipeline():
     # Initialize components
     print("\nInitializing components...")
     planner = QwenVLPlanner(
-        model_name="/workspace/brain_robot/models/qwen2.5-vl-7b",
+        model_name="/workspace/src/models/qwen2.5-vl-7b",
         device="cuda:0",
         max_new_tokens=512,
         temperature=0.1,

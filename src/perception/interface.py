@@ -1,4 +1,4 @@
-"""Perception interface for brain_robot.
+"""Perception interface for src.
 
 Abstract base class defining the perception API.
 All perception implementations (oracle, learned) must follow this interface.

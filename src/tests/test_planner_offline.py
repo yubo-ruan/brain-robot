@@ -8,18 +8,18 @@ import os
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(__file__))))
 
-from brain_robot.planning.plan_validator import (
+from src.planning.plan_validator import (
     parse_qwen_output,
     validate_plan,
     validate_plan_semantics,
 )
-from brain_robot.planning.prompts import (
+from src.planning.prompts import (
     prepare_world_state_for_qwen,
     parse_object_description,
     build_system_prompt,
     build_user_prompt,
 )
-from brain_robot.world_model.state import WorldState, ObjectState
+from src.world_model.state import WorldState, ObjectState
 import numpy as np
 
 

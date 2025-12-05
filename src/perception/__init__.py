@@ -1,4 +1,4 @@
-"""Perception module for brain_robot.
+"""Perception module for src.
 
 Provides perception interfaces and implementations for extracting
 object and robot state from the environment.

@@ -19,16 +19,16 @@ from typing import Dict, List, Any
 # Add parent to path
 sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
 
-from brain_robot.grounding import QwenSemanticGrounder, GroundingMetrics, enrich_objects
-from brain_robot.grounding.ground_truth import (
+from src.grounding import QwenSemanticGrounder, GroundingMetrics, enrich_objects
+from src.grounding.ground_truth import (
     get_ground_truth,
     get_all_ground_truth,
     verify_grounding,
     GroundingGroundTruth,
 )
-from brain_robot.perception.oracle import OraclePerception
-from brain_robot.world_model.state import WorldState
-from brain_robot.utils.seeds import set_global_seed, get_episode_seed
+from src.perception.oracle import OraclePerception
+from src.world_model.state import WorldState
+from src.utils.seeds import set_global_seed, get_episode_seed
 
 
 def make_libero_env(task_suite: str, task_id: int):

@@ -558,9 +558,9 @@ def main():
     parser.add_argument("--use_real_vlm", action="store_true",
                         help="Use real VLM (requires GPU)")
     parser.add_argument("--vlm_model", type=str,
-                        default="/workspace/brain_robot/models/qwen2.5-vl-7b")
+                        default="/workspace/src/models/qwen2.5-vl-7b")
     parser.add_argument("--output_dir", type=str,
-                        default="/workspace/brain_robot/eval_results")
+                        default="/workspace/src/eval_results")
     parser.add_argument("--device", type=str, default="cuda")
     args = parser.parse_args()
 
@@ -582,7 +582,7 @@ def main():
         action_dim = checkpoint.get('action_dim', 7)
 
         if policy_type == 'simple':
-            from brain_robot.policy.vlm_policy import VLMConditionedPolicySimple
+            from src.policy.vlm_policy import VLMConditionedPolicySimple
             policy = VLMConditionedPolicySimple(
                 plan_dim=128,
                 proprio_dim=state_dim,
@@ -590,7 +590,7 @@ def main():
                 hidden_dim=256,
             )
         else:
-            from brain_robot.action_generator.brain_model import BrainInspiredActionGenerator
+            from src.action_generator.brain_model import BrainInspiredActionGenerator
             policy = BrainInspiredActionGenerator(
                 plan_dim=128,
                 proprio_dim=state_dim,
@@ -603,7 +603,7 @@ def main():
         policy.eval()
     else:
         print("No checkpoint provided, using untrained policy")
-        from brain_robot.policy.vlm_policy import VLMConditionedPolicySimple
+        from src.policy.vlm_policy import VLMConditionedPolicySimple
         policy = VLMConditionedPolicySimple(
             plan_dim=128,
             proprio_dim=15,
@@ -616,7 +616,7 @@ def main():
     vlm_planner = None
     if args.use_real_vlm:
         print("Loading VLM planner...")
-        from brain_robot.vlm.qwen_planner import QwenVLPlanner
+        from src.vlm.qwen_planner import QwenVLPlanner
         vlm_planner = QwenVLPlanner(model_name=args.vlm_model)
 
     # Create evaluator

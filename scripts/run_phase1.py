@@ -16,13 +16,13 @@ import numpy as np
 # Add parent to path
 sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
 
-from brain_robot.config import RunConfig, SkillConfig, PerceptionConfig, LoggingConfig
-from brain_robot.perception.oracle import OraclePerception
-from brain_robot.world_model.state import WorldState
-from brain_robot.skills import ApproachSkill, GraspSkill, MoveSkill, PlaceSkill
-from brain_robot.logging.episode_logger import EpisodeLogger, RunSummary
-from brain_robot.utils.seeds import set_global_seed, get_episode_seed
-from brain_robot.utils.git_info import get_git_info
+from src.config import RunConfig, SkillConfig, PerceptionConfig, LoggingConfig
+from src.perception.oracle import OraclePerception
+from src.world_model.state import WorldState
+from src.skills import ApproachSkill, GraspSkill, MoveSkill, PlaceSkill
+from src.logging.episode_logger import EpisodeLogger, RunSummary
+from src.utils.seeds import set_global_seed, get_episode_seed
+from src.utils.git_info import get_git_info
 
 
 def make_libero_env(task_suite: str, task_id: int):

@@ -3,7 +3,7 @@
 Tests geometric heuristics for ON and INSIDE relations without
 requiring the full LIBERO simulator.
 
-Run with: python -m brain_robot.tests.test_spatial_extraction
+Run with: python -m src.tests.test_spatial_extraction
 """
 
 import sys
@@ -13,7 +13,7 @@ import numpy as np
 # Add parent to path
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(__file__))))
 
-from brain_robot.perception.oracle import OraclePerception
+from src.perception.oracle import OraclePerception
 
 
 class MockOraclePerception(OraclePerception):

@@ -11,9 +11,9 @@ import os
 # Add parent to path for imports
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(__file__))))
 
-from brain_robot.perception.oracle import OraclePerception
-from brain_robot.utils.seeds import set_global_seed
-from brain_robot.utils.visualization import debug_plot_poses
+from src.perception.oracle import OraclePerception
+from src.utils.seeds import set_global_seed
+from src.utils.visualization import debug_plot_poses
 
 
 def make_libero_env(task_suite: str = "libero_spatial", task_id: int = 0):
@@ -147,7 +147,7 @@ def test_coordinate_frames():
             debug_plot_poses(
                 gripper_pose=result.gripper_pose,
                 object_poses=result.objects,
-                save_path="/workspace/brain_robot/logs/test_frames.png",
+                save_path="/workspace/src/logs/test_frames.png",
                 title="Coordinate Frame Test"
             )
             print("\nVisualization saved to logs/test_frames.png")

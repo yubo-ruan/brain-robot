@@ -15,10 +15,10 @@ import numpy as np
 from collections import deque
 from tqdm import tqdm
 
-from brain_robot.vlm.qwen_planner import QwenVLPlanner
-from brain_robot.action_generator.brain_model import BrainInspiredActionGenerator
-from brain_robot.env.mock_env import make_mock_env
-from brain_robot.training.rewards import RewardShaper
+from src.vlm.qwen_planner import QwenVLPlanner
+from src.action_generator.brain_model import BrainInspiredActionGenerator
+from src.env.mock_env import make_mock_env
+from src.training.rewards import RewardShaper
 
 
 def test_training_loop(num_episodes: int = 5, verbose: bool = True):
@@ -44,7 +44,7 @@ def test_training_loop(num_episodes: int = 5, verbose: bool = True):
     # Create VLM planner
     print("\nLoading VLM planner...")
     planner = QwenVLPlanner(
-        model_name="/workspace/brain_robot/models/qwen2.5-vl-7b",
+        model_name="/workspace/src/models/qwen2.5-vl-7b",
         device=device,
         max_new_tokens=512,
         temperature=0.1,

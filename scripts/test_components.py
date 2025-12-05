@@ -17,7 +17,7 @@ def test_plan_encoder():
     print("Testing Plan Encoder")
     print("="*50)
 
-    from brain_robot.action_generator.plan_encoder import RelativePlanEncoder
+    from src.action_generator.plan_encoder import RelativePlanEncoder
 
     encoder = RelativePlanEncoder(embed_dim=128, max_movements=5, hidden_dim=64)
 
@@ -55,7 +55,7 @@ def test_forward_model():
     print("Testing Forward Model (Cerebellum)")
     print("="*50)
 
-    from brain_robot.action_generator.forward_model import CerebellumForwardModel
+    from src.action_generator.forward_model import CerebellumForwardModel
 
     model = CerebellumForwardModel(proprio_dim=15, action_dim=7, hidden_dim=128)
 
@@ -83,7 +83,7 @@ def test_brain_model():
     print("Testing Brain-Inspired Action Generator")
     print("="*50)
 
-    from brain_robot.action_generator.brain_model import BrainInspiredActionGenerator
+    from src.action_generator.brain_model import BrainInspiredActionGenerator
 
     model = BrainInspiredActionGenerator(
         plan_dim=128,
@@ -136,7 +136,7 @@ def test_reward_shaper():
     print("Testing Reward Shaper")
     print("="*50)
 
-    from brain_robot.training.rewards import RewardShaper
+    from src.training.rewards import RewardShaper
 
     shaper = RewardShaper()
 

@@ -11,7 +11,7 @@ import numpy as np
 import matplotlib.pyplot as plt
 import matplotlib.patches as patches
 from matplotlib.animation import FuncAnimation, PillowWriter
-from brain_robot.env.mock_env import make_mock_env
+from src.env.mock_env import make_mock_env
 
 
 def get_expert_action(env):
@@ -259,7 +259,7 @@ def create_trajectory_plot(output_path):
 
 
 if __name__ == "__main__":
-    output_dir = "/workspace/brain_robot/recordings"
+    output_dir = "/workspace/src/recordings"
     os.makedirs(output_dir, exist_ok=True)
 
     print("=" * 60)

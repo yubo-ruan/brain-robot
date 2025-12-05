@@ -13,7 +13,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 import numpy as np
 
-from brain_robot.action_generator.brain_model import BrainInspiredActionGenerator
+from src.action_generator.brain_model import BrainInspiredActionGenerator
 
 
 def generate_training_data(batch_size=32):
@@ -198,7 +198,7 @@ def main():
 
     if success:
         # Save checkpoint
-        checkpoint_path = "/workspace/brain_robot/checkpoints/pretrained_selector.pt"
+        checkpoint_path = "/workspace/src/checkpoints/pretrained_selector.pt"
         os.makedirs(os.path.dirname(checkpoint_path), exist_ok=True)
         torch.save({
             'action_generator': action_generator.state_dict(),

@@ -309,9 +309,9 @@ def main():
     parser.add_argument("--use_mock_vlm", action="store_true",
                         help="Use mock VLM plans (for testing without GPU)")
     parser.add_argument("--output_dir", type=str,
-                        default="/workspace/brain_robot/data/vlm_plans")
+                        default="/workspace/src/data/vlm_plans")
     parser.add_argument("--model_path", type=str,
-                        default="/workspace/brain_robot/models/qwen2.5-vl-7b")
+                        default="/workspace/src/models/qwen2.5-vl-7b")
     args = parser.parse_args()
 
     # Create output directory
@@ -346,7 +346,7 @@ def main():
         augmented_samples = create_mock_vlm_plans(samples, task_description)
     else:
         print("Loading VLM planner...")
-        from brain_robot.vlm.qwen_planner import QwenVLPlanner
+        from src.vlm.qwen_planner import QwenVLPlanner
         vlm = QwenVLPlanner(model_name=args.model_path)
 
         augmented_samples = run_vlm_on_samples(

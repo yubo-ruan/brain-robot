@@ -555,7 +555,7 @@ def run_comparison(
     task_id: int = 0,
     n_demos: int = 30,
     n_eval_episodes: int = 5,
-    output_dir: str = "/workspace/brain_robot/recordings/libero_comparison",
+    output_dir: str = "/workspace/src/recordings/libero_comparison",
 ):
     """Run full comparison between approaches."""
 
@@ -567,7 +567,7 @@ def run_comparison(
 
     # Create environment
     print(f"\nCreating LIBERO environment: {task_suite}, task {task_id}")
-    from brain_robot.env.libero_wrapper import make_libero_env
+    from src.env.libero_wrapper import make_libero_env
 
     env = make_libero_env(
         task_suite=task_suite,
@@ -693,7 +693,7 @@ if __name__ == "__main__":
     parser.add_argument("--n_demos", type=int, default=30)
     parser.add_argument("--n_eval", type=int, default=5)
     parser.add_argument("--output_dir", type=str,
-                        default="/workspace/brain_robot/recordings/libero_comparison")
+                        default="/workspace/src/recordings/libero_comparison")
     args = parser.parse_args()
 
     run_comparison(

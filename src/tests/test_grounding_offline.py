@@ -1,7 +1,7 @@
 """Offline tests for semantic grounding.
 
 Tests grounding without running the simulator.
-Run with: python -m brain_robot.tests.test_grounding_offline
+Run with: python -m src.tests.test_grounding_offline
 """
 
 import sys
@@ -10,17 +10,17 @@ import os
 # Add parent to path
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(__file__))))
 
-from brain_robot.grounding.enriched_object import (
+from src.grounding.enriched_object import (
     EnrichedObject,
     parse_object_description,
     get_spatial_descriptions,
 )
-from brain_robot.grounding.grounding_prompts import (
+from src.grounding.grounding_prompts import (
     parse_grounding_output,
     validate_grounding,
     build_grounding_prompt,
 )
-from brain_robot.grounding.semantic_grounder import QwenSemanticGrounder
+from src.grounding.semantic_grounder import QwenSemanticGrounder
 
 
 # ============================================================
@@ -237,7 +237,7 @@ def test_ambiguity_detection():
     print("TEST: Ambiguity detection")
     print("=" * 60)
 
-    from brain_robot.grounding.semantic_grounder import QwenSemanticGrounder
+    from src.grounding.semantic_grounder import QwenSemanticGrounder
 
     grounder = QwenSemanticGrounder()
 

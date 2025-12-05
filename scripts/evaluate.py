@@ -13,9 +13,9 @@ import os
 # Add parent directory to path
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from brain_robot.vlm.qwen_planner import QwenVLPlanner
-from brain_robot.action_generator.brain_model import BrainInspiredActionGenerator
-from brain_robot.env.libero_wrapper import make_libero_env
+from src.vlm.qwen_planner import QwenVLPlanner
+from src.action_generator.brain_model import BrainInspiredActionGenerator
+from src.env.libero_wrapper import make_libero_env
 
 
 def evaluate(

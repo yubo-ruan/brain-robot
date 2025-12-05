@@ -1,4 +1,4 @@
-"""Skills module for brain_robot.
+"""Skills module for src.
 
 Provides composable motor primitives for robot manipulation.
 """

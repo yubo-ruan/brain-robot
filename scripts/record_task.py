@@ -12,7 +12,7 @@ import torch
 from PIL import Image
 import imageio
 
-from brain_robot.env.mock_env import make_mock_env
+from src.env.mock_env import make_mock_env
 
 
 def get_expert_action(env):
@@ -220,7 +220,7 @@ def create_comparison_gif(output_path):
 
 
 if __name__ == "__main__":
-    output_dir = "/workspace/brain_robot/recordings"
+    output_dir = "/workspace/src/recordings"
     os.makedirs(output_dir, exist_ok=True)
 
     print("=" * 60)

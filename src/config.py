@@ -1,4 +1,4 @@
-"""Centralized configuration for the brain_robot system.
+"""Centralized configuration for the src system.
 
 All configuration dataclasses for the zero-shot LIBERO implementation.
 """

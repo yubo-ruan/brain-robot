@@ -1,4 +1,4 @@
-"""World model module for brain_robot.
+"""World model module for src.
 
 Provides symbolic world state representation and goal specification.
 """

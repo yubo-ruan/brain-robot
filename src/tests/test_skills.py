@@ -9,14 +9,14 @@ import os
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(__file__))))
 
-from brain_robot.perception.oracle import OraclePerception
-from brain_robot.world_model.state import WorldState
-from brain_robot.skills.approach import ApproachSkill
-from brain_robot.skills.grasp import GraspSkill
-from brain_robot.skills.move import MoveSkill
-from brain_robot.skills.place import PlaceSkill
-from brain_robot.utils.seeds import set_global_seed
-from brain_robot.config import SkillConfig
+from src.perception.oracle import OraclePerception
+from src.world_model.state import WorldState
+from src.skills.approach import ApproachSkill
+from src.skills.grasp import GraspSkill
+from src.skills.move import MoveSkill
+from src.skills.place import PlaceSkill
+from src.utils.seeds import set_global_seed
+from src.config import SkillConfig
 
 
 def make_libero_env(task_suite: str = "libero_spatial", task_id: int = 0):

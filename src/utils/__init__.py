@@ -1,4 +1,4 @@
-"""Utility modules for brain_robot."""
+"""Utility modules for src."""
 
 from .seeds import set_global_seed, get_episode_seed
 from .timing import Timer

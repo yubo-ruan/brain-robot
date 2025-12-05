@@ -1,4 +1,4 @@
-"""Logging module for brain_robot.
+"""Logging module for src.
 
 Provides episode logging and run tracking.
 """

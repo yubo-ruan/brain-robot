@@ -56,11 +56,11 @@ def test_vlm_scenarios():
     print("VLM Detailed Scenario Tests")
     print("="*60)
 
-    from brain_robot.vlm.qwen_planner import QwenVLPlanner
+    from src.vlm.qwen_planner import QwenVLPlanner
 
     print("\nLoading VLM...")
     planner = QwenVLPlanner(
-        model_name="/workspace/brain_robot/models/qwen2.5-vl-7b",
+        model_name="/workspace/src/models/qwen2.5-vl-7b",
         device="cuda:0",
         max_new_tokens=512,
         temperature=0.1,
@@ -177,10 +177,10 @@ def test_vlm_consistency():
     print("VLM Consistency Test")
     print("="*60)
 
-    from brain_robot.vlm.qwen_planner import QwenVLPlanner
+    from src.vlm.qwen_planner import QwenVLPlanner
 
     planner = QwenVLPlanner(
-        model_name="/workspace/brain_robot/models/qwen2.5-vl-7b",
+        model_name="/workspace/src/models/qwen2.5-vl-7b",
         device="cuda:0",
         max_new_tokens=512,
         temperature=0.1,  # Low temperature for consistency

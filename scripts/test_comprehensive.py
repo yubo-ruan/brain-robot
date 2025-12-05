@@ -19,7 +19,7 @@ def test_mock_environment():
     print("Test 1: Mock Environment")
     print("="*60)
 
-    from brain_robot.env.mock_env import make_mock_env
+    from src.env.mock_env import make_mock_env
 
     env = make_mock_env(max_episode_steps=100)
     print(f"Task: {env.task_description}")
@@ -59,7 +59,7 @@ def test_plan_encoder_batch():
     print("Test 2: Plan Encoder Batch Processing")
     print("="*60)
 
-    from brain_robot.action_generator.plan_encoder import RelativePlanEncoder
+    from src.action_generator.plan_encoder import RelativePlanEncoder
 
     encoder = RelativePlanEncoder(embed_dim=128)
 
@@ -114,7 +114,7 @@ def test_action_generator_primitives():
     print("Test 3: Action Generator Primitive Selection")
     print("="*60)
 
-    from brain_robot.action_generator.brain_model import BrainInspiredActionGenerator
+    from src.action_generator.brain_model import BrainInspiredActionGenerator
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
     model = BrainInspiredActionGenerator(
@@ -165,7 +165,7 @@ def test_forward_model_learning():
     print("Test 4: Forward Model Learning")
     print("="*60)
 
-    from brain_robot.action_generator.forward_model import CerebellumForwardModel
+    from src.action_generator.forward_model import CerebellumForwardModel
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
     model = CerebellumForwardModel(proprio_dim=15, action_dim=7, hidden_dim=64).to(device)
@@ -220,7 +220,7 @@ def test_reward_shaping_scenarios():
     print("Test 5: Reward Shaping Scenarios")
     print("="*60)
 
-    from brain_robot.training.rewards import RewardShaper
+    from src.training.rewards import RewardShaper
 
     shaper = RewardShaper(
         task_success_reward=100.0,
@@ -277,9 +277,9 @@ def test_end_to_end_without_vlm():
     print("Test 6: End-to-End Pipeline (without VLM)")
     print("="*60)
 
-    from brain_robot.env.mock_env import make_mock_env
-    from brain_robot.action_generator.brain_model import BrainInspiredActionGenerator
-    from brain_robot.training.rewards import RewardShaper
+    from src.env.mock_env import make_mock_env
+    from src.action_generator.brain_model import BrainInspiredActionGenerator
+    from src.training.rewards import RewardShaper
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
 

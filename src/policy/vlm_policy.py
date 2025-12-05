@@ -226,7 +226,7 @@ class VLMConditionedPolicySimple(nn.Module):
         self.action_dim = action_dim
 
         # Plan encoder (for JSON plans)
-        from brain_robot.action_generator.plan_encoder import RelativePlanEncoder
+        from src.action_generator.plan_encoder import RelativePlanEncoder
         self.plan_encoder = RelativePlanEncoder(embed_dim=plan_dim)
 
         # Primitive selector

@@ -19,7 +19,7 @@ import numpy as np
 from collections import deque
 import time
 
-from brain_robot.env.mock_env import make_mock_env
+from src.env.mock_env import make_mock_env
 
 
 class PolicyNetwork(nn.Module):

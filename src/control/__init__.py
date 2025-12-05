@@ -1,4 +1,4 @@
-"""Control module for brain_robot.
+"""Control module for src.
 
 Provides low-level controllers for robot motion.
 """

@@ -10,7 +10,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import torch
 import numpy as np
 
-from brain_robot.action_generator.brain_model import BrainInspiredActionGenerator
+from src.action_generator.brain_model import BrainInspiredActionGenerator
 
 
 def test_pretrained():
@@ -33,7 +33,7 @@ def test_pretrained():
     ).to(device)
 
     # Load pre-trained weights
-    checkpoint_path = "/workspace/brain_robot/checkpoints/pretrained_selector.pt"
+    checkpoint_path = "/workspace/src/checkpoints/pretrained_selector.pt"
     if os.path.exists(checkpoint_path):
         print(f"Loading checkpoint from {checkpoint_path}")
         checkpoint = torch.load(checkpoint_path, map_location=device)

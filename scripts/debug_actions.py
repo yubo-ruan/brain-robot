@@ -10,8 +10,8 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import torch
 import numpy as np
 
-from brain_robot.action_generator.brain_model import BrainInspiredActionGenerator
-from brain_robot.action_generator.plan_encoder import RelativePlanEncoder
+from src.action_generator.brain_model import BrainInspiredActionGenerator
+from src.action_generator.plan_encoder import RelativePlanEncoder
 
 
 def debug_action_generation():
@@ -157,7 +157,7 @@ def debug_primitives():
     print("Debugging Motion Primitives (CPGs)")
     print("="*60)
 
-    from brain_robot.action_generator.brain_model import BrainInspiredActionGenerator
+    from src.action_generator.brain_model import BrainInspiredActionGenerator
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
 
