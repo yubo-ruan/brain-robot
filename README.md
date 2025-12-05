@@ -82,15 +82,18 @@ The system mimics the hierarchical organization of the human motor system:
 
 ```bash
 # Clone the repository
-git clone https://github.com/yourusername/brain-robot.git
+git clone https://github.com/yubo-ruan/brain-robot.git
 cd brain-robot
 
 # Install dependencies
-pip install torch torchvision transformers accelerate gymnasium numpy
+pip install torch torchvision transformers accelerate gymnasium numpy huggingface_hub
 
-# Download Qwen2.5-VL-7B model (optional, for full VLM support)
-python -c "from huggingface_hub import snapshot_download; snapshot_download('Qwen/Qwen2.5-VL-7B-Instruct', local_dir='models/qwen2.5-vl-7b')"
+# Download Qwen2.5-VL-7B model (~16GB, required for VLM features)
+python scripts/download_models.py
 ```
+
+> **Note**: The model weights are not included in the repo (`.gitignore`d due to size).
+> Run the download script after cloning. Requires ~16GB disk space and HuggingFace access.
 
 ## Usage
 
