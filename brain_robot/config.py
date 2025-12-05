@@ -34,9 +34,9 @@ class SkillConfig:
     move_pos_threshold: float = 0.05  # 5cm (slightly more relaxed)
 
     # Place skill
-    place_max_steps: int = 100  # Increased
+    place_max_steps: int = 150  # Increased for precise centering
     place_lower_speed: float = 0.02
-    place_release_height: float = 0.05  # 5cm above surface
+    place_release_height: float = 0.02  # 2cm above surface (minimize drop drift)
 
     # Control gains - tuned for robosuite action space
     kp_pos: float = 10.0  # Increased from 5.0

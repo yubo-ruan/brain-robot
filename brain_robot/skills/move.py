@@ -114,9 +114,17 @@ class MoveSkill(Skill):
         return None
     
     def execute(self, env, world_state: WorldState, args: Dict[str, Any]) -> SkillResult:
-        """Execute move: go up, translate, position above target."""
+        """Execute move: go up, translate, position above target.
+
+        Args:
+            args: Dictionary containing:
+                - obj: Object name (required)
+                - region/target: Target region name (required)
+                - waypoint: Optional MOKA waypoint [x, y, z, qw, qx, qy, qz] to override
+        """
         obj_name = args.get("obj")
         target = args.get("region") or args.get("target")
+        moka_waypoint = args.get("waypoint")  # Optional MOKA override
 
         # Get initial pose from world state or step
         current_pose = world_state.gripper_pose
@@ -132,16 +140,58 @@ class MoveSkill(Skill):
                 info={"error_msg": "Failed to get gripper pose", "steps_taken": 0}
             )
 
-        target_pos = self._get_target_position(world_state, target)
-        if target_pos is None:
-            return SkillResult(
-                success=False,
-                info={"error_msg": f"Cannot find target '{target}'", "steps_taken": 0}
-            )
+        # MOKA override: If waypoint provided, use it directly
+        if moka_waypoint is not None:
+            # MOKA provides full 7D waypoint [x, y, z, qw, qx, qy, qz]
+            move_target = np.array(moka_waypoint)
+            using_moka = True
+        else:
+            # Standard path: compute target from region
+            target_pos = self._get_target_position(world_state, target)
+            if target_pos is None:
+                return SkillResult(
+                    success=False,
+                    info={"error_msg": f"Cannot find target '{target}'", "steps_taken": 0}
+                )
+            using_moka = False
 
         steps_taken = 0
         position_history = []  # Track positions for velocity calculation
 
+        # MOKA mode: Move directly to waypoint (already includes height)
+        if using_moka:
+            # MOKA waypoint already has correct height and orientation
+            self.controller.set_target(move_target, gripper=1.0)  # Keep closed
+
+            for step in range(self.max_steps):
+                steps_taken += 1
+                if current_pose is None:
+                    break
+
+                # Check if at target
+                pos_error = np.linalg.norm(current_pose[:3] - move_target[:3])
+                if pos_error < self.pos_threshold:
+                    break
+
+                action = self.controller.compute_action(current_pose)
+                # Moderate orientation control for MOKA waypoints
+                action[3:6] *= 0.5
+                obs, _, _, _ = self._step_env(env, action)
+                current_pose = self._get_gripper_pose(env, obs)
+                last_obs = obs
+
+            final_pose = self._get_gripper_pose(env, last_obs)
+            return SkillResult(
+                success=True,
+                info={
+                    "steps_taken": steps_taken,
+                    "final_pose": final_pose,
+                    "using_moka": True,
+                    "moka_waypoint": moka_waypoint,
+                }
+            )
+
+        # Standard path (non-MOKA): Two-phase movement
         # Dynamic step allocation: lift needs fewer steps than translate
         lift_budget = min(50, self.max_steps // 6)  # Quick lift
         translate_budget = self.max_steps - lift_budget  # Rest for translation
@@ -169,6 +219,8 @@ class MoveSkill(Skill):
                 last_obs = obs
 
         # Phase 2: Translate to above target (gets most of the step budget)
+        # MoveSkill is a simple transport - just moves gripper to target position
+        # PlaceSkill handles precise alignment with grasp offset compensation
         stuck_counter = 0
         height_boost = 0.0  # Additional height when stuck
         max_height_boost = 0.25  # Maximum extra height (increased for edge-of-workspace targets)

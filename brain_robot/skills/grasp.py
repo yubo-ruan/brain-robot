@@ -168,8 +168,17 @@ class GraspSkill(Skill):
         return True, "OK"
     
     def execute(self, env, world_state: WorldState, args: Dict[str, Any]) -> SkillResult:
-        """Execute grasp sequence: [XY refine] -> lower -> close -> lift."""
+        """Execute grasp sequence: [XY refine] -> lower -> close -> lift.
+
+        Args:
+            args: Dictionary containing:
+                - obj: Object name (required)
+                - grasp_point: Optional MOKA grasp point [x, y, z] to override selector
+                - grasp_yaw: Optional MOKA grasp yaw angle (radians) for orientation
+        """
         obj_name = args.get("obj")
+        moka_grasp_point = args.get("grasp_point")  # Optional MOKA override
+        moka_grasp_yaw = args.get("grasp_yaw")      # Optional MOKA orientation
 
         obj_pose = world_state.get_object_pose(obj_name)
         if obj_pose is None:
@@ -223,14 +232,34 @@ class GraspSkill(Skill):
         depth_image, camera_intrinsics, camera_extrinsics = self._extract_depth_data(env, last_obs)
 
         # Compute full 6-DoF grasp pose BEFORE XY refinement
-        # For learned selectors (CGN), this gives us position + orientation + width
-        # For heuristic, gives position with default orientation
-        grasp_xyz, grasp_orientation, grasp_width, grasp_point_info = self._compute_grasp_pose(
-            obj_pose, obj_name, world_state, current_pose,
-            depth_image=depth_image,
-            camera_intrinsics=camera_intrinsics,
-            camera_extrinsics=camera_extrinsics,
-        )
+        # MOKA override: If grasp_point provided, use it directly
+        if moka_grasp_point is not None:
+            # MOKA provides grasp point directly - use it!
+            grasp_xyz = np.array(moka_grasp_point)
+
+            # Convert MOKA yaw to quaternion if provided
+            if moka_grasp_yaw is not None:
+                grasp_orientation = self._yaw_to_quaternion(moka_grasp_yaw)
+            else:
+                grasp_orientation = self.DEFAULT_ORIENTATION.copy()
+
+            grasp_width = 0.0  # MOKA doesn't predict width - use default close
+            grasp_point_info = {
+                "strategy": "moka",
+                "learned_grasp": True,  # Treat MOKA as learned for servo behavior
+                "grasp_strategy_used": "moka",
+                "grasp_confidence": 1.0,
+                "moka_grasp_point": moka_grasp_point,
+                "moka_grasp_yaw": moka_grasp_yaw,
+            }
+        else:
+            # Standard path: use grasp selector (heuristic/CGN/hybrid)
+            grasp_xyz, grasp_orientation, grasp_width, grasp_point_info = self._compute_grasp_pose(
+                obj_pose, obj_name, world_state, current_pose,
+                depth_image=depth_image,
+                camera_intrinsics=camera_intrinsics,
+                camera_extrinsics=camera_extrinsics,
+            )
 
         # Determine if we're using a learned grasp (affects servo behavior)
         using_learned_grasp = grasp_point_info.get("learned_grasp", False)
@@ -940,6 +969,38 @@ class GraspSkill(Skill):
         info["grasp_orientation"] = orientation.tolist()
         info["grasp_gripper_width"] = gripper_width
         return position, info
+
+    def _yaw_to_quaternion(self, yaw: float) -> np.ndarray:
+        """Convert yaw angle to quaternion for gripper orientation.
+
+        Args:
+            yaw: Yaw angle in radians (rotation around Z axis)
+
+        Returns:
+            Quaternion [qw, qx, qy, qz] representing gripper-down with given yaw
+        """
+        # Gripper-down orientation is pitch=-90deg (rotate around X)
+        # Then apply yaw rotation around Z
+        # Using the convention: gripper down = pointing in -Z direction in world frame
+
+        half_yaw = yaw / 2.0
+        half_pitch = -np.pi / 4.0  # -90 degrees for gripper down
+
+        # Quaternion composition: q_yaw * q_pitch
+        # For simplicity, use the default orientation and just rotate by yaw
+        # This assumes the gripper is already oriented downward
+
+        cy = np.cos(half_yaw)
+        sy = np.sin(half_yaw)
+
+        # Gripper down quaternion: [w, x, y, z] ≈ [0.707, 0.707, 0, 0]
+        # Apply yaw: rotate around world Z axis
+        qw = cy * 0.707
+        qx = cy * 0.707
+        qy = sy * 0.707
+        qz = -sy * 0.707
+
+        return np.array([qw, qx, qy, qz])
 
     def update_world_state(
         self,

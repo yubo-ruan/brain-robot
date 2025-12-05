@@ -10,6 +10,12 @@ Perception:
 - learned: YOLO detection + depth-based pose estimation (Phase 4)
 """
 
+# Patch robosuite FIRST - before any other imports that might trigger robosuite
+import os
+import sys
+sys.path.insert(0, os.path.dirname(__file__))
+import patch_robosuite  # noqa: E402, F401 - Must be first
+
 import argparse
 import json
 import os
@@ -755,8 +761,8 @@ def run_episode_qwen_grounded(
 
 def main():
     parser = argparse.ArgumentParser(description="Unified Evaluation (Phase 1, 2 & 3)")
-    parser.add_argument("--mode", type=str, choices=["hardcoded", "qwen", "qwen_grounded"], default="hardcoded",
-                        help="Planning mode: hardcoded (Phase 1), qwen (Phase 2), or qwen_grounded (Phase 3)")
+    parser.add_argument("--mode", type=str, choices=["hardcoded", "qwen", "qwen_grounded", "moka"], default="hardcoded",
+                        help="Planning mode: hardcoded (Phase 1), qwen (Phase 2), qwen_grounded (Phase 3), or moka (MOKA visual prompting)")
     parser.add_argument("--perception", type=str, choices=["oracle", "learned"], default="oracle",
                         help="Perception mode: oracle (ground truth) or learned (YOLO + depth)")
     parser.add_argument("--bootstrap", type=str, choices=["oracle", "cold"], default="oracle",
@@ -966,6 +972,62 @@ def main():
                     grounding_metrics=grounding_metrics,
                     task_id=task_id_str,
                 )
+            elif args.mode == "moka":
+                # MOKA mode: visual prompting-based planning
+                from brain_robot.planning.moka_planner import MOKAPlanner
+
+                # Initialize MOKA planner (lazy initialization per episode)
+                if 'moka_planner' not in locals():
+                    moka_planner = MOKAPlanner()
+
+                # Get RGB and depth observations
+                obs = env.reset()
+                rgb_image = obs.get("agentview_image")
+                depth_image = obs.get("agentview_depth")
+
+                # Plan with MOKA
+                plan_result = moka_planner.plan(
+                    task_description=task_description,
+                    world_state=world_state,
+                    env=env,
+                    rgb_image=rgb_image,
+                    depth_image=depth_image,
+                )
+
+                if not plan_result["success"]:
+                    print(f"  MOKA planning failed: {plan_result.get('error', 'Unknown error')}")
+                    success = False
+                else:
+                    # Execute skills from MOKA plan
+                    print(f"  MOKA generated {len(plan_result['plan'])} skills")
+                    success = True
+                    for skill_spec in plan_result["plan"]:
+                        skill_name = skill_spec["skill"]
+                        skill_args = skill_spec["args"]
+
+                        # Create skill instance
+                        from brain_robot.skills import SKILL_REGISTRY
+                        # Map short name to full skill name
+                        skill_name_map = {
+                            "ApproachSkill": "ApproachObject",
+                            "GraspSkill": "GraspObject",
+                            "MoveSkill": "MoveObjectToRegion",
+                            "PlaceSkill": "PlaceObject",
+                        }
+                        full_name = skill_name_map.get(skill_name, skill_name)
+                        skill_class = SKILL_REGISTRY[full_name]
+                        skill = skill_class(config=config.skill)
+
+                        # Execute skill
+                        print(f"  Executing {skill_name}...")
+                        result = skill.run(env, world_state, skill_args)
+
+                        if not result.success:
+                            print(f"    {skill_name} failed: {result.info.get('error_msg', 'Unknown')}")
+                            success = False
+                            break
+
+                        print(f"    {skill_name}: OK ({result.info.get('steps_taken', 0)} steps)")
         except Exception as e:
             print(f"  Exception: {e}")
             import traceback
