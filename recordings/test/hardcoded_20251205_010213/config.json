@@ -1,0 +1,48 @@
+{
+  "mode": "hardcoded",
+  "perception": {
+    "use_oracle": true,
+    "noise_pos_std": 0.0,
+    "noise_ori_std": 0.0,
+    "stale_threshold_sec": 1.0
+  },
+  "detector": null,
+  "bootstrap": null,
+  "model_path": null,
+  "grasp_selector": "heuristic",
+  "seed": 42,
+  "task_suite": "libero_spatial",
+  "task_id": 0,
+  "n_episodes": 1,
+  "max_episode_steps": 500,
+  "success_rate_threshold": 0.8,
+  "skill": {
+    "approach_max_steps": 200,
+    "approach_pos_threshold": 0.03,
+    "approach_xy_threshold": 0.05,
+    "approach_pregrasp_height": 0.1,
+    "grasp_max_steps": 100,
+    "grasp_lower_speed": 0.02,
+    "grasp_lift_height": 0.05,
+    "grasp_close_threshold": 0.01,
+    "grasp_xy_refine_enabled": true,
+    "grasp_xy_refine_max_steps": 30,
+    "grasp_xy_refine_threshold": 0.03,
+    "grasp_xy_refine_min_improvement": 0.005,
+    "move_max_steps": 400,
+    "move_pos_threshold": 0.05,
+    "place_max_steps": 150,
+    "place_lower_speed": 0.02,
+    "place_release_height": 0.02,
+    "kp_pos": 10.0,
+    "kp_ori": 3.0,
+    "max_action_magnitude": 1.0
+  },
+  "logging": {
+    "output_dir": "/workspace/brain_robot/recordings/test",
+    "save_observations": true,
+    "observation_sample_rate": 10,
+    "save_gifs": true,
+    "gif_fps": 10
+  }
+}
