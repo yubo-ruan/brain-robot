@@ -1,0 +1,38 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "brain-robot"
+version = "0.1.0"
+description = "Brain-inspired LLM-guided robot control for LIBERO benchmark"
+readme = "README.md"
+license = {text = "MIT"}
+requires-python = ">=3.10"
+dependencies = [
+    "torch>=2.0.0",
+    "transformers>=4.37.0",
+    "accelerate>=0.25.0",
+    "gymnasium>=0.29.0",
+    "numpy>=1.24.0",
+    "Pillow>=10.0.0",
+    "pyyaml>=6.0",
+    "wandb>=0.16.0",
+    "tqdm>=4.65.0",
+    "qwen-vl-utils",
+    "huggingface_hub",
+    "libero",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=7.0.0",
+]
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["src*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+python_files = "test_*.py"
